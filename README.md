@@ -1,6 +1,5 @@
-# Noir to R1CS to Groth16 Backend for Stellar
-
-## Executive Summary
+# Noir to Groth16 Backend
+### Noir Lang > ACIR > R1CS > Groth16
 
 Noir compiles programs into an intermediate bytecode format called ACIR, intended to be backend-agnostic. citeturn13search21turn29search23 ACIR’s core constraint opcode is `AssertZero(Expression)` where `Expression` is a quadratic polynomial represented as a sum of multiplication terms, linear terms, and a constant. citeturn14view0turn18view0 This makes an ACIR→R1CS compiler feasible by translating each quadratic `Expression` into (a) a small set of multiplication constraints plus (b) one linear “sum-to-zero” constraint—exactly the approach taken by prior Noir→R1CS work (e.g., pluto/edge and lambdaclass’ experimental backend). citeturn4view2turn3view1
 
