@@ -1,94 +1,113 @@
-# Noir to Groth16 Backend
+# Noir-Groth16
 ### Noir Lang > ACIR > R1CS > Groth16
 
-Noir compiles programs into an intermediate bytecode format called ACIR, intended to be backend-agnostic. citeturn13search21turn29search23 ACIR’s core constraint opcode is `AssertZero(Expression)` where `Expression` is a quadratic polynomial represented as a sum of multiplication terms, linear terms, and a constant. citeturn14view0turn18view0 This makes an ACIR→R1CS compiler feasible by translating each quadratic `Expression` into (a) a small set of multiplication constraints plus (b) one linear “sum-to-zero” constraint—exactly the approach taken by prior Noir→R1CS work (e.g., pluto/edge and lambdaclass’ experimental backend). citeturn4view2turn3view1
+`Noir-Groth16` is a Rust workspace that turns Noir artifacts into deterministic witness and R1CS outputs for Groth16 tooling.
 
-For Stellar/Soroban integration, the limiting factor is not Groth16 itself but on-chain resource ceilings (notably 100M CPU instructions and 40MB RAM per transaction) and the availability of BN254 pairing host functions. citeturn8search1turn7view0 CAP-0074 proposes `bn254_g1_add`, `bn254_g1_mul`, and `bn254_multi_pairing_check` with explicit uncompressed point encodings (G1=64 bytes, G2=128 bytes) and states the curve “no longer offers 128-bit security,” which must be accepted as a tradeoff for ecosystem compatibility. citeturn7view0 Groth16 proofs are “3 points only and 3 pairings,” so a straightforward uncompressed proof payload is ~256 bytes (64+128+64), plus public inputs. citeturn10view0turn7view0
+Pipeline:
+1. Parse Noir artifact JSON + ABI metadata.
+2. Build and solve witnesses with ACVM from ABI-shaped inputs.
+3. Lower supported ACIR constraints into R1CS.
+4. Emit deterministic artifacts (`.r1cs`, `.wtns`, JSON/bin debug outputs).
 
-The most pragmatic build is: reuse Noir’s ACVM tooling for witness generation (including Noir’s BN254 Poseidon2 blackbox solver), compile ACIR→R1CS, then produce Groth16 proofs using a Rust library (arkworks or bellman), with optional `.r1cs/.wtns` emission for snarkjs interoperability. citeturn27view1turn20search10turn19view0turn5search34turn25search2
+## Current Scope (MVP)
 
-## System Goals and Constraints
+- Field target: BN254.
+- Interop target: iden3 `.r1cs` and `.wtns` (snarkjs-compatible).
+- R1CS lowering support: `AssertZero` opcodes.
+- Non-`AssertZero` ACIR opcodes in `noir-r1cs` are rejected with an explicit `UnsupportedOpcode` error.
+- Witness generation uses ACVM and includes a BN254 Poseidon2 permutation blackbox solver.
 
-| Aspect | Spec target | Rationale / source |
-|---|---|---|
-| Proof system | Groth16 | Small proof and pairing-based verification; snarkjs describes Groth16 as “3 points only and 3 pairings.” citeturn10view0 |
-| Curve | BN254 | CAP-0074 proposes native BN254 host functions for Soroban, motivated by EVM compatibility. citeturn7view0 |
-| Soroban transaction limits | 100M CPU instr, 40MB RAM, tx size 132KB | Hard ceiling for verifier contract. citeturn8search1 |
-| Proof encoding for on-chain | Uncompressed G1/G2 bytes | CAP-0074 specifies G1 serialization as `X||Y` (32-byte big-endian coords), G2 as 4×32 bytes. citeturn7view0 |
-| Expected proof size | ~256 bytes (uncompressed) + public inputs | 2×G1 + 1×G2; sizes from CAP-0074; proof structure from snarkjs. citeturn7view0turn10view0 |
-| Hash strategy in-circuit | Prefer Poseidon2; Keccak optional/expensive | Noir exposes `keccakf1600` and Poseidon2 permutation as backends/blackboxes. citeturn28search8turn17view0 Keccak permutation is extremely constraint-heavy in common R1CS gadgets (e.g., gnark). citeturn21search32 |
+## Workspace Layout
 
-If you need strict EVM/snarkjs/Circom interoperability, generate `.r1cs` and `.wtns` in the iden3 binary formats. citeturn19view0turn12search1 If you only need a Stellar verifier, you can skip those files and drive Groth16 directly from Rust constraint matrices + witness vectors.
+- `crates/noir-acir`: Noir artifact parsing, ABI modeling, witness layout helpers.
+- `crates/noir-witness`: ABI input flattening, ACVM witness solving, witness emitters.
+- `crates/noir-r1cs`: ACIR `AssertZero` to R1CS lowering, `.r1cs` and JSON writers.
+- `crates/noir-cli`: CLI entrypoints for parsing, witness generation, R1CS debug output, and interop outputs.
+- `test-vectors/`: minimal fixture artifact + inputs used by tests and examples.
 
-## Architecture and Interfaces
+## CLI Commands
 
-ACIR is the compilation target for Noir and is designed to sit between frontends and proving backends. citeturn13search21turn29search23 The opcode surface area you must handle is small but non-trivial: `AssertZero`, `BlackBoxFuncCall`, `BrilligCall`, `Call`, `Directive`, `MemoryInit`, `MemoryOp`. citeturn18view0turn18view1 In practice, most arithmetic is in `AssertZero(Expression)`; `BlackBoxFuncCall` covers hashes/range/bitwise/etc.; and `BrilligCall` represents unconstrained computation used for witness generation (and must be treated carefully for soundness). citeturn18view1turn29search5
+Binary:
 
-For Poseidon2 specifically, Noir already ships a BN254 Poseidon2 permutation blackbox solver (and constants) that can be reused for witness generation and as the “golden” reference for constraint generation. citeturn27view0turn27view1
+```bash
+cargo run -p noir-cli --bin noir-groth16 -- <command> ...
+```
 
-A proven pattern for ACIR→R1CS is:
-- emit R1CS multiplication constraints for each multiplication term, introducing intermediate variables; then
-- emit one linear constraint that the weighted sum of intermediates + linear terms + constant equals zero.
-This is visible in pluto/edge’s conversion strategy and lambdaclass’ partial implementation. citeturn4view2turn3view1
+### `compile-r1cs`
 
-On-chain, Soroban has explicit per-transaction budgets; Groth16 verification must lean on pairing host functions to fit. citeturn8search1turn7view0
+Parses the artifact and writes a deterministic summary JSON.
 
-image_group{"layout":"carousel","aspect_ratio":"16:9","query":["Groth16 proof structure pairing check diagram","BN254 pairing friendly curve diagram","Stellar Soroban smart contract architecture diagram","R1CS constraint system diagram"],"num_per_query":1}
+```bash
+cargo run -p noir-cli --bin noir-groth16 -- \
+  compile-r1cs test-vectors/fixture_artifact.json --out out/parse
+```
 
-## ACIR to R1CS Compilation Mapping
+Output:
+- `out/parse/parsed.json`
 
-### Opcode coverage scope
+### `witness`
 
-ACIR opcode variants (per `acir` crate) include `AssertZero(Expression)`, `BlackBoxFuncCall`, `BrilligCall`, `Call`, `Directive`, `MemoryInit`, and `MemoryOp`. citeturn18view0turn18view1 `Expression` is a quadratic polynomial with:
-- `mul_terms: Vec<(coef, Witness, Witness)>`
-- `linear_combinations: Vec<(coef, Witness)>`
-- `q_c: constant` citeturn14view0
+Generates witness outputs from artifact + ABI-shaped inputs.
 
-### Mapping table
+```bash
+cargo run -p noir-cli --bin noir-groth16 -- \
+  witness test-vectors/fixture_artifact.json test-vectors/fixture_inputs.json --out out/witness
+```
 
-| ACIR opcode | R1CS compilation template | MVP support |
-|---|---|---|
-| `AssertZero(expr)` | For each `(q, a, b)` in `mul_terms`: allocate `t` and add constraint `(a) * (b) = t`. Then build linear combination `L = Σ(q·t) + Σ(q·w) + q_c` and constrain `1 * L = 0`. citeturn14view0turn4view2 | Yes |
-| `BlackBoxFuncCall(AND/XOR)` | Bit-decompose operands with boolean constraints, compute bitwise op per bit, recompose. (Can share range gadget infra.) citeturn17view0turn15view0 | Optional (after RANGE) |
-| `BlackBoxFuncCall(RANGE)` | Bit-decompose value to `n` bits: enforce each bit boolean and enforce `x = Σ(2^i·b_i)`. citeturn15view0turn17view0 | Yes |
-| `BlackBoxFuncCall(Poseidon2Permutation)` | Expand Poseidon2 round function into field constraints using Noir’s BN254 Poseidon2 reference algorithm/constants. citeturn27view0turn17view0 | Yes (recommended) |
-| `BlackBoxFuncCall(Keccakf1600)` | Either unsupported or behind feature flag; a single Keccak-f permutation can cost ~193,650 Groth16 constraints in gnark’s gadget, so expect very large circuits. citeturn21search32turn28search8 | No (initially) |
-| `BrilligCall` | Adds **no constraints**; only used during witness generation. Treat as “hint”: keep outputs as witnesses, rely on later constraints to bind them. citeturn18view1turn29search5 | Pass-through + warnings |
-| `Call` | Inline sub-circuits or build a flattening pass. ACIR defines `Call` as invoking a separate circuit with its own inputs/outputs/predicate. citeturn18view1 | Later milestone |
-| `MemoryInit`, `MemoryOp` | Requires modeling memory consistency; non-trivial in R1CS. citeturn18view1 | No (initially) |
-| `Directive` | Backend directive; often treated like a hint / compilation-time op. citeturn18view1 | No (initially) |
+Outputs:
+- `out/witness/witness_map.json`
+- `out/witness/witness.bin`
+- `out/witness/witness.wtns`
 
-## Implementation Plan and Repository Layout
+### `r1cs-json`
 
-### Backend choices and interoperability
+Compiles supported ACIR into debug R1CS JSON.
 
-- **Rust Groth16 proving**: `ark-groth16` is a widely used Groth16 implementation in the arkworks ecosystem. citeturn5search34turn23search25
-- **Alternative Rust Groth16**: `bellman` exposes a `groth16` module with parameter generation, proof creation, and verification utilities. citeturn25search2turn25search1
-- **snarkjs interoperability**: Circom docs describe `.r1cs` (constraints) and `.wtns` (witness) as the inputs into snarkjs Groth16 flows, and show commands for trusted setup (`powersoftau`, `groth16 setup`), proving, and verification. citeturn12search0turn11view0turn12search1
-- **Binary formats**: iden3 specifies a standard `.r1cs` binary format with sections (header/constraints/wire map) and requires wire 0 be constant 1. citeturn19view0 The `.wtns` format has Rust parsers/serializers available (`wtns-file`). citeturn20search10
-- **Existing reference work**: pluto/edge compiles Noir/ACIR constraints to R1CS for folding, demonstrating an `AssertZero`→R1CS strategy. citeturn4view2 Lambdaclass’ Noir backend for gnark contains an `acir_to_r1cs` scaffold and highlights endianness/serialization pitfalls between ecosystems. citeturn3view1turn28search11
-- **Additional ecosystem reference**: ProveKit explicitly integrates Noir compilation artifacts and includes “circuit_stats” analysis plus an R1CS JSON export path, useful as a design reference even if you do not adopt their formats. citeturn30view0
+```bash
+cargo run -p noir-cli --bin noir-groth16 -- \
+  r1cs-json test-vectors/fixture_artifact.json --out out/circuit.r1cs.json
+```
 
-### Soroban verification constraints
+Output:
+- `out/circuit.r1cs.json`
 
-Soroban’s resource limits are fixed per transaction. citeturn8search1 To verify BN254 Groth16 efficiently, rely on BN254 host functions that mirror EVM precompiles (pairing check, G1 ops) as proposed in CAP-0074. citeturn7view0 If those host functions are not activated on the target network yet (CAP status is “Awaiting Decision” in the draft), you must either (a) verify on a different curve already supported, or (b) implement pairing in WASM (unlikely to fit the 100M CPU budget). citeturn7view0turn8search1
+### `interop`
 
-### Security considerations baseline
+Emits snarkjs-friendly iden3 binaries (`.r1cs` and `.wtns`).
 
-- **Underconstrained risks**: ACIR supports unconstrained computation (`BrilligCall`), and Noir docs explicitly describe unconstrained functions as not constraining computation (non-deterministic). citeturn18view1turn29search5 Your backend should surface warnings and optionally run underconstraint detection tests.
-- **Curve security**: CAP-0074 notes BN254 “no longer offers 128-bit security.” citeturn7view0 Treat as an explicit acceptance criterion for ecosystem compatibility.
-- **Library pitfalls**: Groth16 extensions (e.g., “commitments”) have had real soundness issues in widely used libraries; avoid nonstandard variants unless audited. citeturn23search14
+```bash
+cargo run -p noir-cli --bin noir-groth16 -- \
+  interop test-vectors/fixture_artifact.json test-vectors/fixture_inputs.json --out out/interop
+```
 
-## Testing, Security, and Reproducibility
+Outputs:
+- `out/interop/circuit.r1cs`
+- `out/interop/witness.wtns`
 
-Testing must validate three independent equivalences:
+## Development Workflow
 
-1) **ACIR semantics vs your witness generator**: using ACVM + noir-provided blackbox solvers (Poseidon2) should reproduce expected witnesses for sample Noir programs. citeturn27view1turn13search18
+Run these before opening a PR:
 
-2) **ACIR→R1CS correctness**: every `AssertZero(Expression)` must become constraints that accept the same satisfying assignments; prior art (pluto/edge) provides a concrete checkable pattern. citeturn4view2turn14view0
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -D warnings
+cargo test --workspace
+```
 
-3) **Interop formats**: `.r1cs` and `.wtns` must be accepted by snarkjs, and/or roundtrip through known parsers (iden3 r1csfile spec; Rust `wtns-file`). citeturn19view0turn12search1turn20search10
+Optional snarkjs interop smoke test:
 
-Reproducibility requirements:
-- pin Rust toolchain, commit `Cargo.lock`, and ensure deterministic serialization ordering for wires/constraints;
-- CI should run unit tests + a minimal end-to-end fixture that compiles a Noir program, generates witness, emits `.r1cs/.wtns`, and (optionally) runs snarkjs verify in Node. citeturn11view0turn12search1turn10view0
+```bash
+npm i -g snarkjs
+cargo test -p noir-cli --features interop-test -- --ignored
+```
+
+## Project Invariants
+
+- Constraint soundness: computed values must be transitively constrained.
+- Determinism: stable constraint ordering, wire indexing, and public input ordering.
+- Encoding discipline: explicit, consistent endianness across emitters/consumers.
+- Underconstrained behavior: unsupported or unconstrained paths should fail loudly in strict flows.
+
+## License
+
+MIT
