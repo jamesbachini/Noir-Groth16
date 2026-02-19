@@ -1,7 +1,7 @@
 # Noir-Groth16
 ### Noir Lang > ACIR > R1CS > Groth16
 
-`Noir-Groth16` is a Rust workspace that turns Noir artifacts into deterministic witness and R1CS outputs for Groth16 tooling.
+Noir-Groth16 is a Rust workspace that turns Noir artifacts into deterministic witness and R1CS outputs for Groth16 tooling.
 
 Pipeline:
 1. Parse Noir artifact JSON + ABI metadata.
@@ -9,7 +9,7 @@ Pipeline:
 3. Lower supported ACIR constraints into R1CS.
 4. Emit deterministic artifacts (`.r1cs`, `.wtns`, JSON/bin debug outputs).
 
-## Current Scope (MVP)
+## Current Scope
 
 - Field target: BN254.
 - Interop target: iden3 `.r1cs` and `.wtns` (snarkjs-compatible).
@@ -107,6 +107,10 @@ cargo test -p noir-cli --features interop-test -- --ignored
 - Determinism: stable constraint ordering, wire indexing, and public input ordering.
 - Encoding discipline: explicit, consistent endianness across emitters/consumers.
 - Underconstrained behavior: unsupported or unconstrained paths should fail loudly in strict flows.
+
+## Disclaimer
+
+Please note code is experimental in nature and not currently suitable for production.
 
 ## License
 
