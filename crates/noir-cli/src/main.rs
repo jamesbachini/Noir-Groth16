@@ -1,9 +1,15 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use noir_acir::Artifact;
-use noir_r1cs::{compile_r1cs, write_r1cs_binary, write_r1cs_json};
+use noir_r1cs::{
+    compile_r1cs, compile_r1cs_with_options, write_r1cs_binary, write_r1cs_json, LoweringOptions,
+    R1csError, UnsupportedOpcodeInfo,
+};
 use noir_witness::{generate_witness, generate_witness_from_json_str, WitnessArtifacts};
 
 #[derive(Debug, Parser)]
@@ -34,6 +40,8 @@ enum Commands {
         artifact: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long, default_value_t = false)]
+        allow_unsupported: bool,
     },
     /// Emit iden3 `.r1cs` and `.wtns` artifacts for snarkjs interop.
     Interop {
@@ -41,6 +49,8 @@ enum Commands {
         inputs: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long, default_value_t = false)]
+        allow_unsupported: bool,
     },
 }
 
@@ -53,12 +63,17 @@ fn main() -> Result<()> {
             inputs,
             out,
         } => witness_cmd(&artifact, &inputs, &out),
-        Commands::R1csJson { artifact, out } => r1cs_json_cmd(&artifact, &out),
+        Commands::R1csJson {
+            artifact,
+            out,
+            allow_unsupported,
+        } => r1cs_json_cmd(&artifact, &out, allow_unsupported),
         Commands::Interop {
             artifact,
             inputs,
             out,
-        } => interop_cmd(&artifact, &inputs, &out),
+            allow_unsupported,
+        } => interop_cmd(&artifact, &inputs, &out, allow_unsupported),
     }
 }
 
@@ -109,9 +124,12 @@ fn witness_cmd(artifact_path: &PathBuf, inputs_path: &PathBuf, out_dir: &PathBuf
     Ok(())
 }
 
-fn r1cs_json_cmd(artifact_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
+fn r1cs_json_cmd(
+    artifact_path: &PathBuf,
+    out_path: &PathBuf,
+    allow_unsupported: bool,
+) -> Result<()> {
     let artifact = load_artifact(artifact_path)?;
-    let system = compile_r1cs(&artifact.program).context("failed compiling R1CS")?;
 
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -119,6 +137,10 @@ fn r1cs_json_cmd(artifact_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
                 .with_context(|| format!("failed creating output dir `{}`", parent.display()))?;
         }
     }
+
+    let diagnostics_path = unsupported_report_path_for_r1cs_json(out_path);
+    let system = compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path))
+        .context("failed compiling R1CS")?;
 
     write_r1cs_json(&system, out_path)
         .with_context(|| format!("failed writing `{}`", out_path.display()))?;
@@ -130,18 +152,24 @@ fn r1cs_json_cmd(artifact_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn interop_cmd(artifact_path: &PathBuf, inputs_path: &PathBuf, out_dir: &PathBuf) -> Result<()> {
+fn interop_cmd(
+    artifact_path: &PathBuf,
+    inputs_path: &PathBuf,
+    out_dir: &PathBuf,
+    allow_unsupported: bool,
+) -> Result<()> {
     let artifact = load_artifact(artifact_path)?;
     let inputs = fs::read_to_string(inputs_path)
         .with_context(|| format!("failed reading inputs `{}`", inputs_path.display()))?;
     let inputs_json: serde_json::Value =
         serde_json::from_str(&inputs).context("invalid inputs json")?;
 
-    let witness = generate_witness(&artifact, &inputs_json).context("failed generating witness")?;
-    let system = compile_r1cs(&artifact.program).context("failed compiling R1CS")?;
-
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed creating output dir `{}`", out_dir.display()))?;
+    let witness = generate_witness(&artifact, &inputs_json).context("failed generating witness")?;
+    let diagnostics_path = out_dir.join("unsupported_opcodes.json");
+    let system = compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path))
+        .context("failed compiling R1CS")?;
 
     let r1cs_path = out_dir.join("circuit.r1cs");
     let wtns_path = out_dir.join("witness.wtns");
@@ -158,6 +186,49 @@ fn interop_cmd(artifact_path: &PathBuf, inputs_path: &PathBuf, out_dir: &PathBuf
         witness.witness_vector.len()
     );
     Ok(())
+}
+
+fn compile_r1cs_for_command(
+    artifact: &Artifact,
+    allow_unsupported: bool,
+    diagnostics_path: Option<&PathBuf>,
+) -> Result<noir_r1cs::R1csSystem> {
+    if !allow_unsupported {
+        return compile_r1cs(&artifact.program).context("strict lowering failed");
+    }
+
+    match compile_r1cs_with_options(&artifact.program, LoweringOptions::allow_unsupported()) {
+        Ok(system) => Ok(system),
+        Err(R1csError::UnsupportedOpcodes { opcodes }) => {
+            if let Some(path) = diagnostics_path {
+                write_unsupported_report(path, &opcodes)?;
+                eprintln!("unsupported opcode report written to `{}`", path.display());
+            }
+            anyhow::bail!(
+                "unsupported opcodes encountered; no R1CS/WTNS emitted (use diagnostics report for details)"
+            )
+        }
+        Err(err) => Err(err).context("failed compiling R1CS"),
+    }
+}
+
+fn write_unsupported_report(path: &PathBuf, opcodes: &[UnsupportedOpcodeInfo]) -> Result<()> {
+    let payload = serde_json::json!({
+        "unsupported_opcode_count": opcodes.len(),
+        "unsupported_opcodes": opcodes,
+    });
+    fs::write(path, serde_json::to_vec_pretty(&payload)?)
+        .with_context(|| format!("failed writing `{}`", path.display()))?;
+    Ok(())
+}
+
+fn unsupported_report_path_for_r1cs_json(out_path: &Path) -> PathBuf {
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            return parent.join("unsupported_opcodes.json");
+        }
+    }
+    PathBuf::from("unsupported_opcodes.json")
 }
 
 fn write_witness_outputs(witness: &WitnessArtifacts, out_dir: &PathBuf) -> Result<()> {

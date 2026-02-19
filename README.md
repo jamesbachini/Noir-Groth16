@@ -1,4 +1,4 @@
-# Noir-Groth16
+# Noir Groth16 Backend
 ### Noir Lang > ACIR > R1CS > Groth16
 
 Noir-Groth16 is a Rust workspace that turns Noir artifacts into deterministic witness and R1CS outputs for Groth16 tooling.
