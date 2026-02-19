@@ -1,0 +1,17 @@
+[package]
+name = "noir-r1cs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+acir.workspace = true
+noir-acir = { path = "../noir-acir" }
+r1cs-file.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+noir-witness = { path = "../noir-witness" }
+tempfile.workspace = true

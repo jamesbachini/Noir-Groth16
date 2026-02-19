@@ -1,0 +1,11 @@
+[package]
+name = "noir-acir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+acir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

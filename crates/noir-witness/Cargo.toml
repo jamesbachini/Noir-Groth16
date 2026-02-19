@@ -1,0 +1,19 @@
+[package]
+name = "noir-witness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+acir.workspace = true
+acvm.workspace = true
+hex = "0.4"
+lazy_static = "1.4"
+noir-acir = { path = "../noir-acir" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wtns-file.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
