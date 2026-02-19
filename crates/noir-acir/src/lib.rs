@@ -192,15 +192,32 @@ impl AbiType {
         match self.kind.as_str() {
             "field" | "boolean" | "integer" => Ok(1),
             "array" => {
-                let len = self.require_u64("length")? as usize;
+                let len_u64 = self.require_u64("length")?;
+                let len = usize::try_from(len_u64).map_err(|_| {
+                    ArtifactError::InvalidAbiShape(format!(
+                        "ABI type `{}` key `length` does not fit usize",
+                        self.kind
+                    ))
+                })?;
                 let inner = self.require_type("type")?;
-                Ok(len * inner.field_count()?)
+                let inner_fields = inner.field_count()?;
+                len.checked_mul(inner_fields).ok_or_else(|| {
+                    ArtifactError::InvalidAbiShape(format!(
+                        "ABI type `{}` field count overflow",
+                        self.kind
+                    ))
+                })
             }
             "tuple" => {
                 let fields = self.require_types("fields")?;
                 let mut total = 0usize;
                 for field in fields {
-                    total += field.field_count()?;
+                    total = total.checked_add(field.field_count()?).ok_or_else(|| {
+                        ArtifactError::InvalidAbiShape(format!(
+                            "ABI type `{}` field count overflow",
+                            self.kind
+                        ))
+                    })?;
                 }
                 Ok(total)
             }
@@ -210,7 +227,12 @@ impl AbiType {
                     .map_err(|err| ArtifactError::InvalidAbiShape(err.to_string()))?;
                 let mut total = 0usize;
                 for field in fields {
-                    total += field.typ.field_count()?;
+                    total = total.checked_add(field.typ.field_count()?).ok_or_else(|| {
+                        ArtifactError::InvalidAbiShape(format!(
+                            "ABI type `{}` field count overflow",
+                            self.kind
+                        ))
+                    })?;
                 }
                 Ok(total)
             }
@@ -263,6 +285,8 @@ pub fn opcode_variant_name(opcode: &Opcode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -291,5 +315,72 @@ mod tests {
   ]
 }"#;
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn witness_layout_errors_when_abi_needs_more_witnesses() {
+        let bytes = include_bytes!("../../../test-vectors/fixture_artifact.json");
+        let mut artifact = Artifact::from_json_bytes(bytes).expect("fixture should parse");
+        artifact.abi.parameters.push(AbiParameter {
+            name: "z".to_string(),
+            typ: AbiType {
+                kind: "field".to_string(),
+                extra: BTreeMap::new(),
+            },
+            visibility: AbiVisibility::Private,
+        });
+
+        let err = artifact
+            .witness_layout()
+            .expect_err("layout should fail when ABI needs more witnesses");
+        match err {
+            ArtifactError::WitnessAllocation {
+                name,
+                needed,
+                remaining,
+            } => {
+                assert_eq!(name, "z");
+                assert_eq!(needed, 1);
+                assert_eq!(remaining, 0);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn abi_field_count_detects_overflow() {
+        let typ: AbiType = serde_json::from_value(serde_json::json!({
+            "kind": "array",
+            "length": u64::MAX,
+            "type": {
+                "kind": "tuple",
+                "fields": [
+                    {"kind": "field"},
+                    {"kind": "field"}
+                ]
+            }
+        }))
+        .expect("abi type should deserialize");
+
+        let err = typ
+            .field_count()
+            .expect_err("overflowing field count should fail");
+        assert!(
+            matches!(err, ArtifactError::InvalidAbiShape(_)),
+            "expected invalid ABI shape error, got {err}"
+        );
+    }
+
+    #[test]
+    fn abi_field_count_rejects_unsupported_kind() {
+        let typ = AbiType {
+            kind: "string".to_string(),
+            extra: BTreeMap::new(),
+        };
+
+        let err = typ
+            .field_count()
+            .expect_err("unsupported type should fail field count");
+        assert!(matches!(err, ArtifactError::UnsupportedAbiType(kind) if kind == "string"));
     }
 }

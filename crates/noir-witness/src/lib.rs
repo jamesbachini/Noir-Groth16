@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, io::Write, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::Path,
+};
 
 use acir::{
     native_types::{Witness, WitnessMap},
@@ -6,6 +10,7 @@ use acir::{
 };
 use acvm::pwg::{ACVMStatus, ACVM};
 use noir_acir::{AbiParameter, AbiType, Artifact, ArtifactError};
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 use wtns_file::{FieldElement as WtnsFieldElement, WtnsFile};
@@ -23,12 +28,16 @@ pub enum WitnessError {
     InputsMustBeObject,
     #[error("missing input value for parameter `{0}`")]
     MissingInput(String),
+    #[error("unexpected input value `{0}` that is not present in ABI")]
+    UnexpectedInput(String),
     #[error("input `{name}` flattened to {actual} field elements, expected {expected}")]
     InputArityMismatch {
         name: String,
         expected: usize,
         actual: usize,
     },
+    #[error("unexpected struct field `{0}`")]
+    UnexpectedStructField(String),
     #[error("failed to parse field value for `{0}`")]
     InvalidFieldValue(String),
     #[error("unsupported ABI type kind `{0}`")]
@@ -45,6 +54,13 @@ pub enum WitnessError {
 pub struct WitnessArtifacts {
     pub witness_map: WitnessMap,
     pub witness_vector: Vec<FieldElement>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct StructField {
+    name: String,
+    #[serde(rename = "type")]
+    typ: AbiType,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -114,7 +130,7 @@ impl acvm::BlackBoxFunctionSolver for NoirBn254BlackBoxSolver {
 }
 
 impl WitnessArtifacts {
-    pub fn witness_map_hex(&self) -> BTreeMap<String, String> {
+    pub fn witness_map_hex(&self) -> BTreeMap<u32, String> {
         let mut out = BTreeMap::new();
         for (index, value) in self
             .witness_map
@@ -122,7 +138,7 @@ impl WitnessArtifacts {
             .into_iter()
             .map(|(witness, value)| (witness.witness_index(), value))
         {
-            out.insert(index.to_string(), format!("0x{}", value.to_hex()));
+            out.insert(index, format!("0x{}", value.to_hex()));
         }
         out
     }
@@ -177,6 +193,21 @@ pub fn generate_witness(
 ) -> Result<WitnessArtifacts, WitnessError> {
     let input_obj = inputs.as_object().ok_or(WitnessError::InputsMustBeObject)?;
     let layout = artifact.witness_layout()?;
+    let expected_inputs = artifact
+        .abi
+        .parameters
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut unexpected = input_obj
+        .keys()
+        .filter(|name| !expected_inputs.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unexpected.sort_unstable();
+    if let Some(name) = unexpected.into_iter().next() {
+        return Err(WitnessError::UnexpectedInput(name));
+    }
 
     let mut initial_witness = WitnessMap::new();
     for (param, assigned) in artifact.abi.parameters.iter().zip(layout.parameters.iter()) {
@@ -247,13 +278,16 @@ fn flatten_value_for_type(typ: &AbiType, value: &Value) -> Result<Vec<FieldEleme
             Ok(vec![FieldElement::from(b)])
         }
         "array" => {
-            let len = typ
+            let len_u64 = typ
                 .extra
                 .get("length")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| {
                     WitnessError::UnsupportedAbiType("array missing length".to_string())
-                })? as usize;
+                })?;
+            let len = usize::try_from(len_u64).map_err(|_| {
+                WitnessError::UnsupportedAbiType("array length does not fit usize".to_string())
+            })?;
 
             let inner_value = typ.extra.get("type").ok_or_else(|| {
                 WitnessError::UnsupportedAbiType("array missing type".to_string())
@@ -308,31 +342,37 @@ fn flatten_value_for_type(typ: &AbiType, value: &Value) -> Result<Vec<FieldEleme
             let fields_value = typ.extra.get("fields").ok_or_else(|| {
                 WitnessError::UnsupportedAbiType("struct missing fields".to_string())
             })?;
-            let fields: Vec<serde_json::Value> = serde_json::from_value(fields_value.clone())
-                .map_err(|_| {
+            let fields: Vec<StructField> =
+                serde_json::from_value(fields_value.clone()).map_err(|_| {
                     WitnessError::UnsupportedAbiType("invalid struct fields".to_string())
                 })?;
 
             let obj = value.as_object().ok_or_else(|| {
                 WitnessError::InvalidFieldValue(format!("expected struct object, got {value}"))
             })?;
+            let expected_fields = fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut unexpected = obj
+                .keys()
+                .filter(|field| !expected_fields.contains(field.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            unexpected.sort_unstable();
+            if let Some(field) = unexpected.into_iter().next() {
+                return Err(WitnessError::UnexpectedStructField(field));
+            }
 
             let mut flattened = Vec::new();
             for field in fields {
-                let name = field.get("name").and_then(Value::as_str).ok_or_else(|| {
-                    WitnessError::UnsupportedAbiType("struct field missing name".to_string())
+                let field_value = obj.get(&field.name).ok_or_else(|| {
+                    WitnessError::InvalidFieldValue(format!(
+                        "missing struct field `{}`",
+                        field.name
+                    ))
                 })?;
-                let typ_value = field.get("type").ok_or_else(|| {
-                    WitnessError::UnsupportedAbiType("struct field missing type".to_string())
-                })?;
-                let field_typ: AbiType =
-                    serde_json::from_value(typ_value.clone()).map_err(|_| {
-                        WitnessError::UnsupportedAbiType("invalid struct field type".to_string())
-                    })?;
-                let field_value = obj.get(name).ok_or_else(|| {
-                    WitnessError::InvalidFieldValue(format!("missing struct field `{name}`"))
-                })?;
-                flattened.extend(flatten_value_for_type(&field_typ, field_value)?);
+                flattened.extend(flatten_value_for_type(&field.typ, field_value)?);
             }
             Ok(flattened)
         }
@@ -555,5 +595,87 @@ mod tests {
         let bytes = fs::read(path).expect("read written wtns");
         let parsed = WtnsFile::<32>::read(Cursor::new(bytes)).expect("wtns should parse");
         assert_eq!(parsed.witness.0.len(), witness.witness_vector.len());
+    }
+
+    #[test]
+    fn rejects_unexpected_top_level_input() {
+        let artifact = Artifact::from_json_bytes(include_bytes!(
+            "../../../test-vectors/fixture_artifact.json"
+        ))
+        .expect("fixture should parse");
+        let inputs = serde_json::json!({
+            "x": "3",
+            "y": "12",
+            "z": "999"
+        });
+
+        let err = generate_witness(&artifact, &inputs).expect_err("unexpected input should fail");
+        assert!(matches!(err, WitnessError::UnexpectedInput(name) if name == "z"));
+    }
+
+    #[test]
+    fn rejects_unexpected_struct_field() {
+        let struct_type: AbiType = serde_json::from_value(serde_json::json!({
+            "kind": "struct",
+            "fields": [
+                {
+                    "name": "a",
+                    "type": { "kind": "field" }
+                }
+            ]
+        }))
+        .expect("struct type should parse");
+
+        let circuit = Circuit {
+            current_witness_index: 1,
+            private_parameters: BTreeSet::from([Witness(1)]),
+            ..Circuit::default()
+        };
+        let artifact = Artifact {
+            noir_version: None,
+            abi: noir_acir::Abi {
+                parameters: vec![noir_acir::AbiParameter {
+                    name: "obj".to_string(),
+                    typ: struct_type,
+                    visibility: noir_acir::AbiVisibility::Private,
+                }],
+                return_type: None,
+                error_types: BTreeMap::new(),
+            },
+            program: Program {
+                functions: vec![circuit],
+                unconstrained_functions: vec![],
+            },
+            program_bytes: Vec::new(),
+        };
+
+        let inputs = serde_json::json!({
+            "obj": {
+                "a": "1",
+                "extra": "2"
+            }
+        });
+        let err = generate_witness(&artifact, &inputs)
+            .expect_err("unexpected struct field should fail witness generation");
+        assert!(matches!(err, WitnessError::UnexpectedStructField(field) if field == "extra"));
+    }
+
+    #[test]
+    fn witness_map_hex_uses_numeric_key_ordering() {
+        let mut witness_map = WitnessMap::new();
+        witness_map.insert(Witness(10), FieldElement::from(10u128));
+        witness_map.insert(Witness(2), FieldElement::from(2u128));
+        witness_map.insert(Witness(1), FieldElement::from(1u128));
+
+        let witness = WitnessArtifacts {
+            witness_map,
+            witness_vector: Vec::new(),
+        };
+        let keys = witness
+            .witness_map_hex()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![1, 2, 10]);
     }
 }

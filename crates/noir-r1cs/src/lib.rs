@@ -118,12 +118,20 @@ pub fn write_r1cs_binary(system: &R1csSystem, path: impl AsRef<Path>) -> Result<
 
 impl R1csSystem {
     pub fn is_satisfied(&self, witness: &[FieldElement]) -> bool {
-        let full_witness = self.materialize_witness(witness);
+        let Some(full_witness) = self.materialize_witness(witness) else {
+            return false;
+        };
 
         for i in 0..self.n_constraints as usize {
-            let left = dot(&self.a[i], &full_witness);
-            let right = dot(&self.b[i], &full_witness);
-            let out = dot(&self.c[i], &full_witness);
+            let Some(left) = dot(&self.a[i], &full_witness) else {
+                return false;
+            };
+            let Some(right) = dot(&self.b[i], &full_witness) else {
+                return false;
+            };
+            let Some(out) = dot(&self.c[i], &full_witness) else {
+                return false;
+            };
             if left * right != out {
                 return false;
             }
@@ -131,7 +139,7 @@ impl R1csSystem {
         true
     }
 
-    fn materialize_witness(&self, witness: &[FieldElement]) -> Vec<FieldElement> {
+    fn materialize_witness(&self, witness: &[FieldElement]) -> Option<Vec<FieldElement>> {
         let mut full = vec![FieldElement::zero(); self.n_wires as usize];
         let copy_len = std::cmp::min(witness.len(), full.len());
         full[..copy_len].copy_from_slice(&witness[..copy_len]);
@@ -149,22 +157,29 @@ impl R1csSystem {
                 && b[0].coeff.is_one()
                 && c[0].coeff.is_one()
             {
+                let lhs_index = a[0].wire as usize;
+                let rhs_index = b[0].wire as usize;
                 let target = c[0].wire as usize;
-                if target >= copy_len && target < full.len() {
-                    let lhs = full[a[0].wire as usize];
-                    let rhs = full[b[0].wire as usize];
+                if target >= full.len() || lhs_index >= full.len() || rhs_index >= full.len() {
+                    return None;
+                }
+                if target >= copy_len {
+                    let lhs = full[lhs_index];
+                    let rhs = full[rhs_index];
                     full[target] = lhs * rhs;
                 }
             }
         }
 
-        full
+        Some(full)
     }
 }
 
-fn dot(row: &SparseRow, witness: &[FieldElement]) -> FieldElement {
-    row.iter().fold(FieldElement::zero(), |acc, term| {
-        acc + term.coeff * witness[term.wire as usize]
+fn dot(row: &SparseRow, witness: &[FieldElement]) -> Option<FieldElement> {
+    row.iter().try_fold(FieldElement::zero(), |acc, term| {
+        witness
+            .get(term.wire as usize)
+            .map(|value| acc + term.coeff * *value)
     })
 }
 
@@ -318,6 +333,74 @@ mod tests {
 
         let system = compile_r1cs(&artifact.program).expect("compile should succeed");
         assert!(system.is_satisfied(&witness.witness_vector));
+    }
+
+    #[test]
+    fn tampered_fixture_witness_fails_compiled_r1cs() {
+        let artifact = Artifact::from_json_bytes(include_bytes!(
+            "../../../test-vectors/fixture_artifact.json"
+        ))
+        .expect("fixture should parse");
+        let witness = generate_witness_from_json_str(
+            &artifact,
+            include_str!("../../../test-vectors/fixture_inputs.json"),
+        )
+        .expect("witness generation should succeed");
+        let mut tampered = witness.witness_vector.clone();
+        tampered[1] += FieldElement::one();
+
+        let system = compile_r1cs(&artifact.program).expect("compile should succeed");
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn malformed_rows_do_not_panic_and_fail_satisfaction() {
+        let system = R1csSystem {
+            n_wires: 2,
+            n_constraints: 1,
+            n_public_outputs: 0,
+            n_public_inputs: 0,
+            n_private_inputs: 1,
+            a: vec![vec![SparseTerm {
+                wire: 0,
+                coeff: FieldElement::one(),
+            }]],
+            b: vec![vec![SparseTerm {
+                wire: 9,
+                coeff: FieldElement::one(),
+            }]],
+            c: vec![Vec::new()],
+        };
+
+        assert!(!system.is_satisfied(&[FieldElement::one(), FieldElement::one()]));
+    }
+
+    #[test]
+    fn empty_program_is_rejected() {
+        let program = Program {
+            functions: Vec::new(),
+            unconstrained_functions: Vec::new(),
+        };
+
+        let err = compile_r1cs(&program).expect_err("empty program should fail");
+        assert!(matches!(err, R1csError::EmptyProgram));
+    }
+
+    #[test]
+    fn unsupported_opcode_is_rejected() {
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BrilligCall {
+                id: 0,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                predicate: None,
+            }],
+            ..Circuit::default()
+        };
+
+        let err = compile_r1cs_circuit(&circuit).expect_err("unsupported opcode should fail");
+        assert!(matches!(err, R1csError::UnsupportedOpcode(name) if name == "BrilligCall"));
     }
 
     #[test]
