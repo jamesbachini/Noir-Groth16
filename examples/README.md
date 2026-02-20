@@ -34,7 +34,7 @@ Current examples:
 From repository root:
 
 ```bash
-./examples/run_tutorial_suite.sh
+./examples/run_test_suite.sh
 ```
 
 This runs:

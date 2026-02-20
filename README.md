@@ -152,7 +152,7 @@ cd /mnt/c/code/Noir-Groth16
 ### Optional: run full example suite
 
 ```bash
-./examples/run_tutorial_suite.sh
+./examples/run_test_suite.sh
 ```
 
 ## Current ACIR Support (crates/noir-r1cs)
