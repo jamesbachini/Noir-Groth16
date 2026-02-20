@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 acir.workspace = true
+acir_legacy = { git = "https://github.com/noir-lang/noir.git", tag = "v1.0.0-beta.18", package = "acir" }
+acir_046 = { version = "0.46.0", package = "acir" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+base64 = "0.22"

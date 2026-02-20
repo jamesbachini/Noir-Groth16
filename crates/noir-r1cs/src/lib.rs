@@ -6,11 +6,11 @@ use std::{
 
 use acir::{
     circuit::{
-        opcodes::{BlackBoxFuncCall, FunctionInput},
-        AssertionPayload, Circuit, Opcode, OpcodeLocation, Program,
+        opcodes::{BlackBoxFuncCall, BlockId, FunctionInput, MemOp},
+        Circuit, Opcode, OpcodeLocation, Program,
     },
     native_types::{Expression, Witness},
-    FieldElement,
+    AcirField, FieldElement,
 };
 use r1cs_file::{
     Constraint, Constraints, FieldElement as R1csFieldElement, Header, R1csFile, WireMap,
@@ -100,35 +100,43 @@ pub struct R1csSystem {
     pub c: Vec<SparseRow>,
 }
 
-pub fn lower_program(program: &Program) -> Result<R1csSystem, R1csError> {
+type AcirProgram = Program<FieldElement>;
+type AcirCircuit = Circuit<FieldElement>;
+type AcirOpcode = Opcode<FieldElement>;
+type AcirExpression = Expression<FieldElement>;
+type AcirFunctionInput = FunctionInput<FieldElement>;
+type AcirBlackBoxFuncCall = BlackBoxFuncCall<FieldElement>;
+type AcirMemOp = MemOp<FieldElement>;
+
+pub fn lower_program(program: &AcirProgram) -> Result<R1csSystem, R1csError> {
     compile_r1cs(program)
 }
 
-pub fn compile_r1cs(program: &Program) -> Result<R1csSystem, R1csError> {
+pub fn compile_r1cs(program: &AcirProgram) -> Result<R1csSystem, R1csError> {
     compile_r1cs_with_options(program, LoweringOptions::strict())
 }
 
 pub fn compile_r1cs_with_options(
-    program: &Program,
+    program: &AcirProgram,
     options: LoweringOptions,
 ) -> Result<R1csSystem, R1csError> {
     let circuit = program.functions.first().ok_or(R1csError::EmptyProgram)?;
     compile_r1cs_circuit_with_options(circuit, options)
 }
 
-pub fn compile_r1cs_circuit(circuit: &Circuit) -> Result<R1csSystem, R1csError> {
+pub fn compile_r1cs_circuit(circuit: &AcirCircuit) -> Result<R1csSystem, R1csError> {
     compile_r1cs_circuit_with_options(circuit, LoweringOptions::strict())
 }
 
 pub fn compile_r1cs_circuit_with_options(
-    circuit: &Circuit,
+    circuit: &AcirCircuit,
     options: LoweringOptions,
 ) -> Result<R1csSystem, R1csError> {
     LoweringContext::new(circuit, options).lower()
 }
 
 pub fn collect_unsupported_opcodes(
-    program: &Program,
+    program: &AcirProgram,
 ) -> Result<Vec<UnsupportedOpcodeInfo>, R1csError> {
     match compile_r1cs_with_options(program, LoweringOptions::allow_unsupported()) {
         Ok(_) => Ok(Vec::new()),
@@ -174,7 +182,7 @@ pub fn write_r1cs_binary(system: &R1csSystem, path: impl AsRef<Path>) -> Result<
 }
 
 struct LoweringContext<'a> {
-    circuit: &'a Circuit,
+    circuit: &'a AcirCircuit,
     options: LoweringOptions,
     field_modulus_le_bytes: [u8; 32],
     wire_map: BTreeMap<u32, u32>,
@@ -184,12 +192,12 @@ struct LoweringContext<'a> {
     a_rows: Vec<SparseRow>,
     b_rows: Vec<SparseRow>,
     c_rows: Vec<SparseRow>,
-    memory_blocks: BTreeMap<u32, Vec<Expression>>,
+    memory_blocks: BTreeMap<u32, Vec<AcirExpression>>,
     unsupported: Vec<UnsupportedOpcodeInfo>,
 }
 
 impl<'a> LoweringContext<'a> {
-    fn new(circuit: &'a Circuit, options: LoweringOptions) -> Self {
+    fn new(circuit: &'a AcirCircuit, options: LoweringOptions) -> Self {
         let mut wire_map = BTreeMap::new();
         for witness in 0..=circuit.current_witness_index {
             wire_map.insert(witness, witness);
@@ -307,21 +315,14 @@ impl<'a> LoweringContext<'a> {
         Ok(())
     }
 
-    fn lower_opcode(&mut self, index: usize, opcode: &Opcode) -> Result<(), R1csError> {
+    fn lower_opcode(&mut self, index: usize, opcode: &AcirOpcode) -> Result<(), R1csError> {
         match opcode {
             Opcode::AssertZero(expr) => self.lower_assert_zero(expr, index, "AssertZero"),
-            Opcode::MemoryInit { block_id, init } => self.lower_memory_init(*block_id, init, index),
-            Opcode::MemoryOp {
-                block_id,
-                op,
-                predicate,
-            } => self.lower_memory_op(*block_id, op, predicate.as_ref(), index),
+            Opcode::MemoryInit { block_id, init, .. } => {
+                self.lower_memory_init(*block_id, init, index)
+            }
+            Opcode::MemoryOp { block_id, op } => self.lower_memory_op(*block_id, op, index),
             Opcode::BlackBoxFuncCall(call) => self.lower_blackbox(call, index),
-            Opcode::Directive(_) => self.unsupported_opcode(
-                "Directive",
-                index,
-                "directive lowering is not implemented".to_string(),
-            ),
             Opcode::BrilligCall { .. } => self.unsupported_opcode(
                 "BrilligCall",
                 index,
@@ -337,7 +338,7 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_assert_zero(
         &mut self,
-        expr: &Expression,
+        expr: &AcirExpression,
         opcode_index: usize,
         context: &str,
     ) -> Result<(), R1csError> {
@@ -407,7 +408,7 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_memory_init(
         &mut self,
-        block_id: acir::circuit::opcodes::BlockId,
+        block_id: BlockId,
         init: &[Witness],
         opcode_index: usize,
     ) -> Result<(), R1csError> {
@@ -431,23 +432,10 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_memory_op(
         &mut self,
-        block_id: acir::circuit::opcodes::BlockId,
-        op: &acir::circuit::opcodes::MemOp,
-        predicate: Option<&Expression>,
+        block_id: BlockId,
+        op: &AcirMemOp,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
-        if let Some(predicate) = predicate {
-            let pred = canonicalize_expression(predicate);
-            if pred.to_const().map(|value| value.is_one()) != Some(true) {
-                return self.unsupported_opcode(
-                    "MemoryOp",
-                    opcode_index,
-                    "dynamic or disabled memory predicates are unsupported in strict lowering"
-                        .to_string(),
-                );
-            }
-        }
-
         let operation = canonicalize_expression(&op.operation);
         let op_kind = operation
             .to_const()
@@ -520,17 +508,25 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_blackbox(
         &mut self,
-        call: &BlackBoxFuncCall,
+        call: &AcirBlackBoxFuncCall,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
         match call {
-            BlackBoxFuncCall::AND { lhs, rhs, output } => {
-                self.lower_boolean_and(lhs, rhs, *output, opcode_index)
+            BlackBoxFuncCall::AND {
+                lhs,
+                rhs,
+                num_bits,
+                output,
+            } => self.lower_boolean_and(lhs, rhs, *num_bits, *output, opcode_index),
+            BlackBoxFuncCall::XOR {
+                lhs,
+                rhs,
+                num_bits,
+                output,
+            } => self.lower_boolean_xor(lhs, rhs, *num_bits, *output, opcode_index),
+            BlackBoxFuncCall::RANGE { input, num_bits } => {
+                self.lower_boolean_range(input, *num_bits, opcode_index)
             }
-            BlackBoxFuncCall::XOR { lhs, rhs, output } => {
-                self.lower_boolean_xor(lhs, rhs, *output, opcode_index)
-            }
-            BlackBoxFuncCall::RANGE { input } => self.lower_boolean_range(input, opcode_index),
             other => self.unsupported_opcode(
                 "BlackBoxFuncCall",
                 opcode_index,
@@ -544,37 +540,40 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_boolean_and(
         &mut self,
-        lhs: &FunctionInput,
-        rhs: &FunctionInput,
+        lhs: &AcirFunctionInput,
+        rhs: &AcirFunctionInput,
+        num_bits: u32,
         output: Witness,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
-        if lhs.num_bits != 1 || rhs.num_bits != 1 {
+        if num_bits != 1 {
             return self.unsupported_opcode(
                 "BlackBoxFuncCall::AND",
                 opcode_index,
                 format!(
-                    "AND lowering currently supports only num_bits=1, got lhs={} rhs={}",
-                    lhs.num_bits, rhs.num_bits
+                    "AND lowering currently supports only num_bits=1, got {}",
+                    num_bits
                 ),
             );
         }
 
-        self.ensure_witness_in_range(lhs.witness, "BlackBox AND lhs")?;
-        self.ensure_witness_in_range(rhs.witness, "BlackBox AND rhs")?;
+        let lhs = self.extract_witness_input(lhs, "BlackBox AND lhs", opcode_index)?;
+        let rhs = self.extract_witness_input(rhs, "BlackBox AND rhs", opcode_index)?;
+        self.ensure_witness_in_range(lhs, "BlackBox AND lhs")?;
+        self.ensure_witness_in_range(rhs, "BlackBox AND rhs")?;
         self.ensure_witness_in_range(output, "BlackBox AND output")?;
 
-        self.enforce_boolean_witness(lhs.witness)?;
-        self.enforce_boolean_witness(rhs.witness)?;
+        self.enforce_boolean_witness(lhs)?;
+        self.enforce_boolean_witness(rhs)?;
         self.enforce_boolean_witness(output)?;
 
         self.emit_constraint(
             vec![SparseTerm {
-                wire: self.wire_for_witness(lhs.witness)?,
+                wire: self.wire_for_witness(lhs)?,
                 coeff: FieldElement::one(),
             }],
             vec![SparseTerm {
-                wire: self.wire_for_witness(rhs.witness)?,
+                wire: self.wire_for_witness(rhs)?,
                 coeff: FieldElement::one(),
             }],
             vec![SparseTerm {
@@ -586,36 +585,39 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_boolean_xor(
         &mut self,
-        lhs: &FunctionInput,
-        rhs: &FunctionInput,
+        lhs: &AcirFunctionInput,
+        rhs: &AcirFunctionInput,
+        num_bits: u32,
         output: Witness,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
-        if lhs.num_bits != 1 || rhs.num_bits != 1 {
+        if num_bits != 1 {
             return self.unsupported_opcode(
                 "BlackBoxFuncCall::XOR",
                 opcode_index,
                 format!(
-                    "XOR lowering currently supports only num_bits=1, got lhs={} rhs={}",
-                    lhs.num_bits, rhs.num_bits
+                    "XOR lowering currently supports only num_bits=1, got {}",
+                    num_bits
                 ),
             );
         }
 
-        self.ensure_witness_in_range(lhs.witness, "BlackBox XOR lhs")?;
-        self.ensure_witness_in_range(rhs.witness, "BlackBox XOR rhs")?;
+        let lhs = self.extract_witness_input(lhs, "BlackBox XOR lhs", opcode_index)?;
+        let rhs = self.extract_witness_input(rhs, "BlackBox XOR rhs", opcode_index)?;
+        self.ensure_witness_in_range(lhs, "BlackBox XOR lhs")?;
+        self.ensure_witness_in_range(rhs, "BlackBox XOR rhs")?;
         self.ensure_witness_in_range(output, "BlackBox XOR output")?;
 
-        self.enforce_boolean_witness(lhs.witness)?;
-        self.enforce_boolean_witness(rhs.witness)?;
+        self.enforce_boolean_witness(lhs)?;
+        self.enforce_boolean_witness(rhs)?;
         self.enforce_boolean_witness(output)?;
 
         let xor_expr = Expression {
-            mul_terms: vec![(FieldElement::from(2u128), lhs.witness, rhs.witness)],
+            mul_terms: vec![(FieldElement::from(2u128), lhs, rhs)],
             linear_combinations: vec![
                 (FieldElement::one(), output),
-                (-FieldElement::one(), lhs.witness),
-                (-FieldElement::one(), rhs.witness),
+                (-FieldElement::one(), lhs),
+                (-FieldElement::one(), rhs),
             ],
             q_c: FieldElement::zero(),
         };
@@ -624,22 +626,24 @@ impl<'a> LoweringContext<'a> {
 
     fn lower_boolean_range(
         &mut self,
-        input: &FunctionInput,
+        input: &AcirFunctionInput,
+        num_bits: u32,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
-        if input.num_bits != 1 {
+        if num_bits != 1 {
             return self.unsupported_opcode(
                 "BlackBoxFuncCall::RANGE",
                 opcode_index,
                 format!(
                     "RANGE lowering currently supports only num_bits=1, got {}",
-                    input.num_bits
+                    num_bits
                 ),
             );
         }
 
-        self.ensure_witness_in_range(input.witness, "BlackBox RANGE input")?;
-        self.enforce_boolean_witness(input.witness)
+        let input = self.extract_witness_input(input, "BlackBox RANGE input", opcode_index)?;
+        self.ensure_witness_in_range(input, "BlackBox RANGE input")?;
+        self.enforce_boolean_witness(input)
     }
 
     fn enforce_boolean_witness(&mut self, witness: Witness) -> Result<(), R1csError> {
@@ -744,13 +748,14 @@ impl<'a> LoweringContext<'a> {
 
     fn assert_message_for_index(&self, index: usize) -> Option<String> {
         for (location, payload) in &self.circuit.assert_messages {
-            if matches!(location, OpcodeLocation::Acir(i) if *i == index) {
-                return Some(match payload {
-                    AssertionPayload::StaticString(msg) => msg.clone(),
-                    AssertionPayload::Dynamic(selector, _) => {
-                        format!("dynamic selector={selector}")
-                    }
-                });
+            if let OpcodeLocation::Acir(i) = *location {
+                if i == index {
+                    return Some(format!(
+                        "selector={}, payload_len={}",
+                        payload.error_selector,
+                        payload.payload.len()
+                    ));
+                }
             }
         }
         None
@@ -758,7 +763,7 @@ impl<'a> LoweringContext<'a> {
 
     fn ensure_expression_witnesses_in_range(
         &self,
-        expr: &Expression,
+        expr: &AcirExpression,
         context: &str,
     ) -> Result<(), R1csError> {
         for (_, lhs, rhs) in &expr.mul_terms {
@@ -769,6 +774,25 @@ impl<'a> LoweringContext<'a> {
             self.ensure_witness_in_range(*witness, context)?;
         }
         Ok(())
+    }
+
+    fn extract_witness_input(
+        &mut self,
+        input: &AcirFunctionInput,
+        opcode: &str,
+        index: usize,
+    ) -> Result<Witness, R1csError> {
+        match input {
+            FunctionInput::Witness(witness) => Ok(*witness),
+            FunctionInput::Constant(_) => {
+                self.unsupported_opcode(
+                    opcode,
+                    index,
+                    "constant blackbox inputs are unsupported in strict lowering".to_string(),
+                )?;
+                unreachable!("unsupported_opcode returns Err in strict mode")
+            }
+        }
     }
 
     fn ensure_witness_in_range(&self, witness: Witness, context: &str) -> Result<(), R1csError> {
@@ -895,7 +919,7 @@ fn canonicalize_row(row: SparseRow) -> SparseRow {
         .collect()
 }
 
-fn canonicalize_expression(expr: &Expression) -> Expression {
+fn canonicalize_expression(expr: &AcirExpression) -> AcirExpression {
     let mut mul_map: BTreeMap<(u32, u32), FieldElement> = BTreeMap::new();
     for (coeff, lhs, rhs) in &expr.mul_terms {
         if coeff.is_zero() {
@@ -932,8 +956,8 @@ fn canonicalize_expression(expr: &Expression) -> Expression {
     }
 }
 
-fn field_to_usize(value: FieldElement) -> Option<usize> {
-    (value.num_bits() <= usize::BITS).then(|| value.to_u128() as usize)
+fn field_to_usize(value: &FieldElement) -> Option<usize> {
+    (value.num_bits() <= usize::BITS).then(|| (*value).to_u128() as usize)
 }
 
 fn to_r1cs_terms(row: &SparseRow) -> Vec<(R1csFieldElement<32>, u32)> {
@@ -972,11 +996,10 @@ fn bn254_modulus_le_bytes() -> [u8; 32] {
     be
 }
 
-fn opcode_variant(opcode: &Opcode) -> &'static str {
+fn opcode_variant(opcode: &AcirOpcode) -> &'static str {
     match opcode {
         Opcode::AssertZero(_) => "AssertZero",
         Opcode::BlackBoxFuncCall(_) => "BlackBoxFuncCall",
-        Opcode::Directive(_) => "Directive",
         Opcode::MemoryOp { .. } => "MemoryOp",
         Opcode::MemoryInit { .. } => "MemoryInit",
         Opcode::BrilligCall { .. } => "BrilligCall",
@@ -990,7 +1013,8 @@ mod tests {
 
     use acir::{
         circuit::{
-            opcodes::{BlackBoxFuncCall, FunctionInput, MemOp},
+            brillig::BrilligFunctionId,
+            opcodes::{AcirFunctionId, BlackBoxFuncCall, BlockType, FunctionInput, MemOp},
             Circuit, Opcode, Program, PublicInputs,
         },
         native_types::{Expression, Witness},
@@ -1125,10 +1149,10 @@ mod tests {
         let circuit = Circuit {
             current_witness_index: 0,
             opcodes: vec![Opcode::BrilligCall {
-                id: 0,
+                id: BrilligFunctionId(0),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
-                predicate: None,
+                predicate: Expression::one(),
             }],
             ..Circuit::default()
         };
@@ -1153,16 +1177,17 @@ mod tests {
         let circuit = Circuit {
             current_witness_index: 1,
             opcodes: vec![
-                Opcode::Directive(acir::circuit::directives::Directive::ToLeRadix {
-                    a: Expression::from(Witness(1)),
-                    b: vec![Witness(1)],
-                    radix: 2,
-                }),
                 Opcode::BrilligCall {
-                    id: 0,
+                    id: BrilligFunctionId(0),
                     inputs: Vec::new(),
                     outputs: Vec::new(),
-                    predicate: None,
+                    predicate: Expression::one(),
+                },
+                Opcode::Call {
+                    id: AcirFunctionId(1),
+                    inputs: vec![Witness(1)],
+                    outputs: vec![Witness(1)],
+                    predicate: Expression::one(),
                 },
             ],
             ..Circuit::default()
@@ -1177,8 +1202,8 @@ mod tests {
         match err {
             R1csError::UnsupportedOpcodes { opcodes } => {
                 assert_eq!(opcodes.len(), 2);
-                assert_eq!(opcodes[0].opcode, "Directive");
-                assert_eq!(opcodes[1].opcode, "BrilligCall");
+                assert_eq!(opcodes[0].opcode, "BrilligCall");
+                assert_eq!(opcodes[1].opcode, "Call");
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -1211,6 +1236,7 @@ mod tests {
                 Opcode::MemoryInit {
                     block_id: acir::circuit::opcodes::BlockId(0),
                     init: vec![Witness(1), Witness(2)],
+                    block_type: BlockType::Memory,
                 },
                 Opcode::MemoryOp {
                     block_id: acir::circuit::opcodes::BlockId(0),
@@ -1218,7 +1244,6 @@ mod tests {
                         Expression::from_field(FieldElement::zero()),
                         Witness(3),
                     ),
-                    predicate: None,
                 },
                 Opcode::AssertZero(Expression {
                     mul_terms: Vec::new(),
@@ -1234,7 +1259,6 @@ mod tests {
                         Expression::from_field(FieldElement::one()),
                         &Expression::from(Witness(1)) + &Expression::from(Witness(2)),
                     ),
-                    predicate: None,
                 },
                 Opcode::MemoryOp {
                     block_id: acir::circuit::opcodes::BlockId(0),
@@ -1242,7 +1266,6 @@ mod tests {
                         Expression::from_field(FieldElement::one()),
                         Witness(4),
                     ),
-                    predicate: None,
                 },
                 Opcode::AssertZero(Expression {
                     mul_terms: Vec::new(),
@@ -1282,11 +1305,11 @@ mod tests {
                 Opcode::MemoryInit {
                     block_id: acir::circuit::opcodes::BlockId(0),
                     init: vec![Witness(1)],
+                    block_type: BlockType::Memory,
                 },
                 Opcode::MemoryOp {
                     block_id: acir::circuit::opcodes::BlockId(0),
                     op: MemOp::read_at_mem_index(Expression::from(Witness(2)), Witness(1)),
-                    predicate: None,
                 },
             ],
             private_parameters: BTreeSet::from([Witness(1), Witness(2)]),
@@ -1315,32 +1338,20 @@ mod tests {
     #[test]
     fn boolean_blackboxes_are_supported() {
         let and = Opcode::BlackBoxFuncCall(BlackBoxFuncCall::AND {
-            lhs: FunctionInput {
-                witness: Witness(1),
-                num_bits: 1,
-            },
-            rhs: FunctionInput {
-                witness: Witness(2),
-                num_bits: 1,
-            },
+            lhs: FunctionInput::Witness(Witness(1)),
+            rhs: FunctionInput::Witness(Witness(2)),
+            num_bits: 1,
             output: Witness(3),
         });
         let xor = Opcode::BlackBoxFuncCall(BlackBoxFuncCall::XOR {
-            lhs: FunctionInput {
-                witness: Witness(1),
-                num_bits: 1,
-            },
-            rhs: FunctionInput {
-                witness: Witness(2),
-                num_bits: 1,
-            },
+            lhs: FunctionInput::Witness(Witness(1)),
+            rhs: FunctionInput::Witness(Witness(2)),
+            num_bits: 1,
             output: Witness(4),
         });
         let range = Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
-            input: FunctionInput {
-                witness: Witness(1),
-                num_bits: 1,
-            },
+            input: FunctionInput::Witness(Witness(1)),
+            num_bits: 1,
         });
         let bind = Opcode::AssertZero(Expression {
             mul_terms: Vec::new(),
@@ -1381,10 +1392,8 @@ mod tests {
         let circuit = Circuit {
             current_witness_index: 1,
             opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
-                input: FunctionInput {
-                    witness: Witness(1),
-                    num_bits: 8,
-                },
+                input: FunctionInput::Witness(Witness(1)),
+                num_bits: 8,
             })],
             private_parameters: BTreeSet::from([Witness(1)]),
             ..Circuit::default()
@@ -1556,16 +1565,16 @@ mod tests {
             current_witness_index: 1,
             opcodes: vec![
                 Opcode::BrilligCall {
-                    id: 0,
+                    id: BrilligFunctionId(0),
                     inputs: Vec::new(),
                     outputs: Vec::new(),
-                    predicate: None,
+                    predicate: Expression::one(),
                 },
                 Opcode::Call {
-                    id: 1,
+                    id: AcirFunctionId(1),
                     inputs: vec![Witness(1)],
                     outputs: vec![Witness(1)],
-                    predicate: None,
+                    predicate: Expression::one(),
                 },
             ],
             ..Circuit::default()

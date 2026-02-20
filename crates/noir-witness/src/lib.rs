@@ -6,17 +6,17 @@ use std::{
 
 use acir::{
     native_types::{Witness, WitnessMap},
-    BlackBoxFunc, FieldElement,
+    AcirField, FieldElement,
 };
 use acvm::pwg::{ACVMStatus, ACVM};
+use bn254_blackbox_solver::Bn254BlackBoxSolver;
 use noir_acir::{AbiParameter, AbiType, Artifact, ArtifactError};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 use wtns_file::{FieldElement as WtnsFieldElement, WtnsFile};
 
-mod poseidon2;
-pub use poseidon2::poseidon2_permutation;
+pub use bn254_blackbox_solver::poseidon2_permutation;
 
 #[derive(Debug, Error)]
 pub enum WitnessError {
@@ -52,7 +52,7 @@ pub enum WitnessError {
 
 #[derive(Clone, Debug)]
 pub struct WitnessArtifacts {
-    pub witness_map: WitnessMap,
+    pub witness_map: WitnessMap<FieldElement>,
     pub witness_vector: Vec<FieldElement>,
 }
 
@@ -63,72 +63,6 @@ struct StructField {
     typ: AbiType,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct NoirBn254BlackBoxSolver;
-
-impl NoirBn254BlackBoxSolver {
-    fn unsupported(function: BlackBoxFunc) -> acvm::BlackBoxResolutionError {
-        acvm::BlackBoxResolutionError::Failed(
-            function,
-            format!("{} is not supported", function.name()),
-        )
-    }
-}
-
-impl acvm::BlackBoxFunctionSolver for NoirBn254BlackBoxSolver {
-    fn schnorr_verify(
-        &self,
-        _public_key_x: &FieldElement,
-        _public_key_y: &FieldElement,
-        _signature: &[u8; 64],
-        _message: &[u8],
-    ) -> Result<bool, acvm::BlackBoxResolutionError> {
-        Err(Self::unsupported(BlackBoxFunc::SchnorrVerify))
-    }
-
-    fn pedersen_commitment(
-        &self,
-        _inputs: &[FieldElement],
-        _domain_separator: u32,
-    ) -> Result<(FieldElement, FieldElement), acvm::BlackBoxResolutionError> {
-        Err(Self::unsupported(BlackBoxFunc::PedersenCommitment))
-    }
-
-    fn pedersen_hash(
-        &self,
-        _inputs: &[FieldElement],
-        _domain_separator: u32,
-    ) -> Result<FieldElement, acvm::BlackBoxResolutionError> {
-        Err(Self::unsupported(BlackBoxFunc::PedersenHash))
-    }
-
-    fn multi_scalar_mul(
-        &self,
-        _points: &[FieldElement],
-        _scalars: &[FieldElement],
-    ) -> Result<(FieldElement, FieldElement), acvm::BlackBoxResolutionError> {
-        Err(Self::unsupported(BlackBoxFunc::MultiScalarMul))
-    }
-
-    fn ec_add(
-        &self,
-        _input1_x: &FieldElement,
-        _input1_y: &FieldElement,
-        _input2_x: &FieldElement,
-        _input2_y: &FieldElement,
-    ) -> Result<(FieldElement, FieldElement), acvm::BlackBoxResolutionError> {
-        Err(Self::unsupported(BlackBoxFunc::EmbeddedCurveAdd))
-    }
-
-    fn poseidon2_permutation(
-        &self,
-        inputs: &[FieldElement],
-        len: u32,
-    ) -> Result<Vec<FieldElement>, acvm::BlackBoxResolutionError> {
-        poseidon2_permutation(inputs, len)
-    }
-}
-
 impl WitnessArtifacts {
     pub fn witness_map_hex(&self) -> BTreeMap<u32, String> {
         let mut out = BTreeMap::new();
@@ -136,7 +70,7 @@ impl WitnessArtifacts {
             .witness_map
             .clone()
             .into_iter()
-            .map(|(witness, value)| (witness.witness_index(), value))
+            .map(|(witness, value): (Witness, FieldElement)| (witness.witness_index(), value))
         {
             out.insert(index, format!("0x{}", value.to_hex()));
         }
@@ -229,7 +163,7 @@ pub fn generate_witness(
         }
     }
 
-    let solver = NoirBn254BlackBoxSolver;
+    let solver = Bn254BlackBoxSolver;
     let circuit = artifact.main_circuit();
     let mut acvm = ACVM::new(
         &solver,
@@ -401,7 +335,7 @@ fn parse_field(value: &Value) -> Result<FieldElement, WitnessError> {
 }
 
 fn witness_map_to_vector(
-    witness_map: &WitnessMap,
+    witness_map: &WitnessMap<FieldElement>,
     current_witness_index: u32,
 ) -> Vec<FieldElement> {
     let mut witness_vector = vec![FieldElement::zero(); (current_witness_index + 1) as usize];
@@ -485,29 +419,16 @@ mod tests {
             FieldElement::from(3u128),
             FieldElement::from(4u128),
         ];
-        let expected = poseidon2_permutation(&inputs, 4).expect("poseidon2 reference should run");
+        let expected = poseidon2_permutation(&inputs).expect("poseidon2 reference should run");
 
         let poseidon = Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Poseidon2Permutation {
             inputs: vec![
-                FunctionInput {
-                    witness: Witness(1),
-                    num_bits: FieldElement::max_num_bits(),
-                },
-                FunctionInput {
-                    witness: Witness(2),
-                    num_bits: FieldElement::max_num_bits(),
-                },
-                FunctionInput {
-                    witness: Witness(3),
-                    num_bits: FieldElement::max_num_bits(),
-                },
-                FunctionInput {
-                    witness: Witness(4),
-                    num_bits: FieldElement::max_num_bits(),
-                },
+                FunctionInput::Witness(Witness(1)),
+                FunctionInput::Witness(Witness(2)),
+                FunctionInput::Witness(Witness(3)),
+                FunctionInput::Witness(Witness(4)),
             ],
             outputs: vec![Witness(5), Witness(6), Witness(7), Witness(8)],
-            len: 4,
         });
 
         // Add one arithmetic constraint so this fixture also exercises AssertZero solving.

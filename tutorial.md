@@ -58,10 +58,12 @@ If verify succeeds, `snarkjs` prints `OK`.
 Example circuit (`src/main.nr`):
 
 ```rust
-fn main(x: Field, pub y: Field) {
+fn main(x: Field, y: pub Field) {
     assert(x * x == y);
 }
 ```
+
+`assert(x != y)` currently lowers through `BrilligCall`, which this repo rejects in strict R1CS lowering.
 
 Compile with Noir (`nargo compile`), then run:
 
