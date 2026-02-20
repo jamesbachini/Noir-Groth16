@@ -9,6 +9,33 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn parse_interop_counts(stdout: &[u8]) -> (u32, u32, usize) {
+    let text = String::from_utf8_lossy(stdout);
+    let line = text
+        .lines()
+        .find(|line| line.contains("n_wires="))
+        .expect("interop output should include circuit summary");
+
+    let mut n_wires = None;
+    let mut n_constraints = None;
+    let mut witness_len = None;
+    for part in line.split_whitespace() {
+        if let Some(value) = part.strip_prefix("n_wires=") {
+            n_wires = Some(value.parse::<u32>().expect("n_wires should parse"));
+        } else if let Some(value) = part.strip_prefix("n_constraints=") {
+            n_constraints = Some(value.parse::<u32>().expect("n_constraints should parse"));
+        } else if let Some(value) = part.strip_prefix("witness_len=") {
+            witness_len = Some(value.parse::<usize>().expect("witness_len should parse"));
+        }
+    }
+
+    (
+        n_wires.expect("n_wires should be present"),
+        n_constraints.expect("n_constraints should be present"),
+        witness_len.expect("witness_len should be present"),
+    )
+}
+
 #[test]
 fn witness_command_writes_outputs() {
     let artifact = fixture_path("fixture_artifact.json");
@@ -151,6 +178,11 @@ fn interop_command_is_deterministic_for_blackbox_fixture() {
             "interop command failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        let (n_wires, _, witness_len) = parse_interop_counts(&output.stdout);
+        assert_eq!(
+            witness_len, n_wires as usize,
+            "interop witness should be expanded to full wire count"
         );
     }
 

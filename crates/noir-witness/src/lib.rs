@@ -366,11 +366,11 @@ fn witness_map_to_vector(
     witness_map: &WitnessMap<FieldElement>,
     current_witness_index: u32,
 ) -> Vec<FieldElement> {
-    let mut witness_vector = vec![FieldElement::zero(); (current_witness_index + 1) as usize];
+    let mut witness_vector = vec![FieldElement::zero(); (current_witness_index + 2) as usize];
     witness_vector[0] = FieldElement::one();
-    for index in 1..=current_witness_index {
+    for index in 0..=current_witness_index {
         if let Some(value) = witness_map.get_index(index) {
-            witness_vector[index as usize] = *value;
+            witness_vector[(index + 1) as usize] = *value;
         }
     }
     witness_vector
@@ -394,8 +394,8 @@ fn field_to_le_bytes_32(value: FieldElement) -> [u8; 32] {
 fn bn254_modulus_le_bytes() -> [u8; 32] {
     let mut be = [
         0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58,
-        0x5d, 0x97, 0x81, 0x6a, 0x91, 0x68, 0x71, 0xca, 0x8d, 0x3c, 0x20, 0x8c, 0x16, 0xd8, 0x7c,
-        0xfd, 0x47,
+        0x5d, 0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00,
+        0x00, 0x01,
     ];
     be.reverse();
     be
@@ -544,6 +544,10 @@ mod tests {
         let bytes = fs::read(path).expect("read written wtns");
         let parsed = WtnsFile::<32>::read(Cursor::new(bytes)).expect("wtns should parse");
         assert_eq!(parsed.witness.0.len(), witness.witness_vector.len());
+        assert_eq!(
+            parsed.header.prime,
+            WtnsFieldElement::from(bn254_modulus_le_bytes())
+        );
     }
 
     #[test]

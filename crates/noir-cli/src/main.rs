@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use noir_acir::Artifact;
 use noir_r1cs::{
@@ -166,10 +166,14 @@ fn interop_cmd(
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed creating output dir `{}`", out_dir.display()))?;
-    let witness = generate_witness(&artifact, &inputs_json).context("failed generating witness")?;
+    let mut witness =
+        generate_witness(&artifact, &inputs_json).context("failed generating witness")?;
     let diagnostics_path = out_dir.join("unsupported_opcodes.json");
     let system = compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path))
         .context("failed compiling R1CS")?;
+    witness.witness_vector = system
+        .materialize_witness(&witness.witness_vector)
+        .ok_or_else(|| anyhow!("failed materializing witness for {} wires", system.n_wires))?;
 
     let r1cs_path = out_dir.join("circuit.r1cs");
     let wtns_path = out_dir.join("witness.wtns");

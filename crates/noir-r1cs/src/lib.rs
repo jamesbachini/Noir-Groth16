@@ -235,7 +235,7 @@ impl<'a> LoweringContext<'a> {
     fn new_for_circuit(circuit: &'a AcirCircuit, options: LoweringOptions) -> Self {
         let mut wire_map = BTreeMap::new();
         for witness in 0..=circuit.current_witness_index {
-            wire_map.insert(witness, witness);
+            wire_map.insert(witness, witness + 1);
         }
 
         Self {
@@ -247,7 +247,7 @@ impl<'a> LoweringContext<'a> {
             field_modulus_le_bytes: bn254_modulus_le_bytes(),
             wire_map,
             next_virtual_witness_index: circuit.current_witness_index + 1,
-            next_wire: circuit.current_witness_index + 1,
+            next_wire: circuit.current_witness_index + 2,
             next_memory_block_id: next_memory_block_id(circuit),
             allocated_intermediate_wires: BTreeSet::new(),
             constrained_wires: BTreeSet::new(),
@@ -1760,7 +1760,7 @@ impl R1csSystem {
         true
     }
 
-    fn materialize_witness(&self, witness: &[FieldElement]) -> Option<Vec<FieldElement>> {
+    pub fn materialize_witness(&self, witness: &[FieldElement]) -> Option<Vec<FieldElement>> {
         let mut full = vec![FieldElement::zero(); self.n_wires as usize];
         let mut known = vec![false; self.n_wires as usize];
         let copy_len = std::cmp::min(witness.len(), full.len());
@@ -2433,8 +2433,8 @@ fn field_to_le_bytes_32(value: FieldElement) -> [u8; 32] {
 fn bn254_modulus_le_bytes() -> [u8; 32] {
     let mut be = [
         0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58,
-        0x5d, 0x97, 0x81, 0x6a, 0x91, 0x68, 0x71, 0xca, 0x8d, 0x3c, 0x20, 0x8c, 0x16, 0xd8, 0x7c,
-        0xfd, 0x47,
+        0x5d, 0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00,
+        0x00, 0x01,
     ];
     be.reverse();
     be
@@ -2537,7 +2537,7 @@ mod tests {
         )
         .expect("witness generation should succeed");
         let mut tampered = witness.witness_vector.clone();
-        tampered[1] += FieldElement::one();
+        tampered[2] += FieldElement::one();
 
         let system = compile_r1cs(&artifact.program).expect("compile should succeed");
         assert!(!system.is_satisfied(&tampered));
@@ -2638,6 +2638,7 @@ mod tests {
         let system = compile_r1cs(&program).expect("Brillig inverse hint pattern should compile");
         let witness = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(3u128),
             FieldElement::from(2u128),
             FieldElement::one(),
@@ -2679,6 +2680,7 @@ mod tests {
 
         let tampered = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(3u128),
             FieldElement::from(2u128),
             FieldElement::from(2u128),
@@ -2769,6 +2771,10 @@ mod tests {
 
         assert_eq!(parsed.header.n_constraints, system.n_constraints);
         assert_eq!(parsed.header.n_wires, system.n_wires);
+        assert_eq!(
+            parsed.header.prime,
+            R1csFieldElement::from(bn254_modulus_le_bytes())
+        );
     }
 
     #[test]
@@ -3152,6 +3158,7 @@ mod tests {
 
         let witness = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(7u128),
             FieldElement::from(9u128),
             FieldElement::from(16u128),
@@ -3160,7 +3167,7 @@ mod tests {
         assert_r1cs_satisfied(&first, &witness);
 
         let mut tampered = witness.clone();
-        tampered[3] = FieldElement::from(17u128);
+        tampered[4] = FieldElement::from(17u128);
         assert!(!first.is_satisfied(&tampered));
     }
 
@@ -3191,6 +3198,7 @@ mod tests {
         let system = compile_r1cs(&program).expect("predicate-zero call should lower");
         let witness_ok = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(123u128),
             FieldElement::zero(),
         ];
@@ -3198,6 +3206,7 @@ mod tests {
 
         let witness_bad = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(123u128),
             FieldElement::one(),
         ];
@@ -3240,6 +3249,7 @@ mod tests {
 
         let pred_true = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(7u128),
             FieldElement::from(9u128),
             FieldElement::one(),
@@ -3250,6 +3260,7 @@ mod tests {
 
         let pred_false = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(7u128),
             FieldElement::from(9u128),
             FieldElement::zero(),
@@ -3260,6 +3271,7 @@ mod tests {
 
         let pred_true_tampered = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(7u128),
             FieldElement::from(9u128),
             FieldElement::one(),
@@ -3269,6 +3281,7 @@ mod tests {
 
         let pred_false_tampered = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(7u128),
             FieldElement::from(9u128),
             FieldElement::zero(),
@@ -3312,6 +3325,7 @@ mod tests {
         let system = compile_r1cs(&program).expect("dynamic-predicate call should lower");
         let non_boolean_predicate = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::from(7u128),
             FieldElement::from(9u128),
             FieldElement::from(2u128),
@@ -3372,6 +3386,7 @@ mod tests {
         let system = compile_r1cs(&program).expect("mux-style assertzero should compile");
         let witness = vec![
             FieldElement::one(),
+            FieldElement::zero(),
             FieldElement::one(),
             FieldElement::from(9u128),
             FieldElement::from(4u128),
