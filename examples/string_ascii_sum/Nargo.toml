@@ -1,0 +1,7 @@
+[package]
+name = "string_ascii_sum"
+type = "bin"
+authors = ["noir-groth16"]
+compiler_version = ">=1.0.0"
+
+[dependencies]

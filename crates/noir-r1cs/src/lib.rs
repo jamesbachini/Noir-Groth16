@@ -1742,22 +1742,7 @@ impl R1csSystem {
         let Some(full_witness) = self.materialize_witness(witness) else {
             return false;
         };
-
-        for i in 0..self.n_constraints as usize {
-            let Some(left) = dot(&self.a[i], &full_witness) else {
-                return false;
-            };
-            let Some(right) = dot(&self.b[i], &full_witness) else {
-                return false;
-            };
-            let Some(out) = dot(&self.c[i], &full_witness) else {
-                return false;
-            };
-            if left * right != out {
-                return false;
-            }
-        }
-        true
+        self.is_satisfied_with_full_witness(&full_witness)
     }
 
     pub fn materialize_witness(&self, witness: &[FieldElement]) -> Option<Vec<FieldElement>> {
@@ -1773,6 +1758,8 @@ impl R1csSystem {
             known[0] = true;
         }
 
+        let boolean_wires = self.collect_boolean_wires();
+
         // ACIR witness vectors include only original witnesses. Intermediate wires introduced
         // by lowering can often be solved from a single R1CS row if all other terms are known.
         let max_rounds = (self.n_wires as usize).saturating_mul(8).max(1);
@@ -1782,6 +1769,12 @@ impl R1csSystem {
                 break;
             }
             progress = false;
+            if self.populate_bit_decomposition_wires(&boolean_wires, &mut full, &mut known)? {
+                progress = true;
+            }
+            if self.populate_selector_wires_from_one_hot_patterns(&mut full, &mut known)? {
+                progress = true;
+            }
             for i in 0..self.n_constraints as usize {
                 let a = eval_linear_form(&self.a[i], &full, &known)?;
                 let b = eval_linear_form(&self.b[i], &full, &known)?;
@@ -1790,39 +1783,24 @@ impl R1csSystem {
                 if self.c[i].len() == 1 {
                     let term = self.c[i][0].clone();
                     let target = term.wire as usize;
-                    if target >= copy_len && target < full.len() && !term.coeff.is_zero() {
+                    if a.1.is_empty()
+                        && b.1.is_empty()
+                        && target >= copy_len
+                        && target < full.len()
+                        && !term.coeff.is_zero()
+                    {
                         let lhs = dot(&self.a[i], &full)?;
                         let rhs = dot(&self.b[i], &full)?;
                         let new_value = (lhs * rhs) / term.coeff;
-                        if !known[target] || full[target] != new_value {
+                        if known[target] {
+                            if full[target] != new_value {
+                                return None;
+                            }
+                        } else {
                             full[target] = new_value;
                             progress = true;
+                            known[target] = true;
                         }
-                        known[target] = true;
-                        continue;
-                    }
-                }
-
-                if self.c[i].is_empty()
-                    && self.a[i].len() == 1
-                    && self.a[i][0].wire == 0
-                    && self.a[i][0].coeff.is_one()
-                {
-                    if let Some(target_term) = self.b[i]
-                        .iter()
-                        .filter(|term| term.wire as usize >= copy_len && !term.coeff.is_zero())
-                        .max_by_key(|term| term.wire)
-                    {
-                        let target = target_term.wire as usize;
-                        let coeff = target_term.coeff;
-                        let total = dot(&self.b[i], &full)?;
-                        let other_sum = total - coeff * full[target];
-                        let new_value = -other_sum / coeff;
-                        if !known[target] || full[target] != new_value {
-                            full[target] = new_value;
-                            progress = true;
-                        }
-                        known[target] = true;
                         continue;
                     }
                 }
@@ -1860,15 +1838,19 @@ impl R1csSystem {
                 // directly from the current A/B values.
                 if c.1.len() == 1 {
                     let (wire, coeff) = c.1[0];
-                    if !coeff.is_zero() {
+                    if !coeff.is_zero() && a.1.is_empty() && b.1.is_empty() {
                         let lhs = dot(&self.a[i], &full)?;
                         let rhs = dot(&self.b[i], &full)?;
                         let new_value = (lhs * rhs - c.0) / coeff;
-                        if !known[wire] || full[wire] != new_value {
+                        if known[wire] {
+                            if full[wire] != new_value {
+                                return None;
+                            }
+                        } else {
                             full[wire] = new_value;
                             progress = true;
+                            known[wire] = true;
                         }
-                        known[wire] = true;
                         continue;
                     }
                 }
@@ -1929,8 +1911,353 @@ impl R1csSystem {
             }
         }
 
+        if !self.is_satisfied_with_full_witness(&full) {
+            return None;
+        }
+
         Some(full)
     }
+
+    fn is_satisfied_with_full_witness(&self, full_witness: &[FieldElement]) -> bool {
+        for i in 0..self.n_constraints as usize {
+            let Some(left) = dot(&self.a[i], full_witness) else {
+                return false;
+            };
+            let Some(right) = dot(&self.b[i], full_witness) else {
+                return false;
+            };
+            let Some(out) = dot(&self.c[i], full_witness) else {
+                return false;
+            };
+            if left * right != out {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn collect_boolean_wires(&self) -> BTreeSet<usize> {
+        let mut wires = BTreeSet::new();
+        for i in 0..self.n_constraints as usize {
+            if let Some(wire) = boolean_constraint_wire(&self.a[i], &self.b[i], &self.c[i]) {
+                wires.insert(wire);
+            }
+        }
+        wires
+    }
+
+    fn populate_bit_decomposition_wires(
+        &self,
+        boolean_wires: &BTreeSet<usize>,
+        witness: &mut [FieldElement],
+        known: &mut [bool],
+    ) -> Option<bool> {
+        let max_rounds = self.n_constraints as usize;
+        let mut progress = true;
+        let mut changed = false;
+        for _ in 0..max_rounds {
+            if !progress {
+                break;
+            }
+            progress = false;
+
+            for i in 0..self.n_constraints as usize {
+                let Some((output_wire, bit_wires)) =
+                    bit_decomposition_pattern(&self.a[i], &self.b[i], &self.c[i], boolean_wires)
+                else {
+                    continue;
+                };
+
+                if output_wire >= witness.len() || !known[output_wire] {
+                    continue;
+                }
+
+                let output_bits = field_to_bits_le(witness[output_wire], bit_wires.len());
+                for (bit_wire, bit) in bit_wires.iter().zip(output_bits.into_iter()) {
+                    if *bit_wire >= witness.len() || *bit_wire >= known.len() {
+                        return None;
+                    }
+                    let value = if bit {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    };
+                    if known[*bit_wire] {
+                        if witness[*bit_wire] != value {
+                            return None;
+                        }
+                        continue;
+                    }
+                    witness[*bit_wire] = value;
+                    known[*bit_wire] = true;
+                    progress = true;
+                    changed = true;
+                }
+            }
+        }
+
+        Some(changed)
+    }
+
+    fn populate_selector_wires_from_one_hot_patterns(
+        &self,
+        witness: &mut [FieldElement],
+        known: &mut [bool],
+    ) -> Option<bool> {
+        let max_rounds = self.n_constraints as usize;
+        let mut progress = true;
+        let mut changed = false;
+        for _ in 0..max_rounds {
+            if !progress {
+                break;
+            }
+            progress = false;
+
+            for i in 0..self.n_constraints as usize {
+                let Some(selector_wires) = selector_sum_pattern(&self.a[i], &self.b[i], &self.c[i])
+                else {
+                    continue;
+                };
+
+                let mut index_wire = None;
+                for j in 0..self.n_constraints as usize {
+                    if let Some(wire) =
+                        selector_index_pattern(&self.a[j], &self.b[j], &self.c[j], &selector_wires)
+                    {
+                        index_wire = Some(wire);
+                        break;
+                    }
+                }
+                let Some(index_wire) = index_wire else {
+                    continue;
+                };
+                if index_wire >= witness.len() || !known[index_wire] {
+                    continue;
+                }
+
+                let Some(index_value) = field_to_usize(witness[index_wire]) else {
+                    continue;
+                };
+                if index_value >= selector_wires.len() {
+                    continue;
+                }
+
+                for (position, selector_wire) in selector_wires.iter().copied().enumerate() {
+                    if selector_wire >= witness.len() || selector_wire >= known.len() {
+                        return None;
+                    }
+                    let value = if position == index_value {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    };
+                    if known[selector_wire] {
+                        if witness[selector_wire] != value {
+                            return None;
+                        }
+                        continue;
+                    }
+                    witness[selector_wire] = value;
+                    known[selector_wire] = true;
+                    progress = true;
+                    changed = true;
+                }
+            }
+        }
+
+        Some(changed)
+    }
+}
+
+fn boolean_constraint_wire(
+    a_row: &SparseRow,
+    b_row: &SparseRow,
+    c_row: &SparseRow,
+) -> Option<usize> {
+    if !c_row.is_empty() {
+        return None;
+    }
+
+    if a_row.len() == 1 && a_row[0].coeff.is_one() {
+        let wire = a_row[0].wire as usize;
+        if b_row.len() == 2 {
+            let has_self = b_row
+                .iter()
+                .any(|term| term.wire == a_row[0].wire && term.coeff.is_one());
+            let has_neg_one = b_row
+                .iter()
+                .any(|term| term.wire == 0 && term.coeff == -FieldElement::one());
+            if has_self && has_neg_one {
+                return Some(wire);
+            }
+        }
+    }
+
+    if b_row.len() == 1 && b_row[0].coeff.is_one() {
+        let wire = b_row[0].wire as usize;
+        if a_row.len() == 2 {
+            let has_self = a_row
+                .iter()
+                .any(|term| term.wire == b_row[0].wire && term.coeff.is_one());
+            let has_neg_one = a_row
+                .iter()
+                .any(|term| term.wire == 0 && term.coeff == -FieldElement::one());
+            if has_self && has_neg_one {
+                return Some(wire);
+            }
+        }
+    }
+
+    None
+}
+
+fn bit_decomposition_pattern(
+    a_row: &SparseRow,
+    b_row: &SparseRow,
+    c_row: &SparseRow,
+    boolean_wires: &BTreeSet<usize>,
+) -> Option<(usize, Vec<usize>)> {
+    if a_row.len() != 1
+        || a_row[0].wire != 0
+        || !a_row[0].coeff.is_one()
+        || c_row.len() != 1
+        || !c_row[0].coeff.is_one()
+        || b_row.is_empty()
+    {
+        return None;
+    }
+
+    let mut expected_coeff = FieldElement::one();
+    let mut bit_wires = Vec::with_capacity(b_row.len());
+    for term in b_row {
+        if term.coeff != expected_coeff {
+            return None;
+        }
+        if !boolean_wires.contains(&(term.wire as usize)) {
+            return None;
+        }
+        bit_wires.push(term.wire as usize);
+        expected_coeff += expected_coeff;
+    }
+
+    Some((c_row[0].wire as usize, bit_wires))
+}
+
+fn field_to_bits_le(value: FieldElement, num_bits: usize) -> Vec<bool> {
+    let be = value.to_be_bytes();
+    let mut bits = Vec::with_capacity(num_bits);
+    for i in 0..num_bits {
+        let byte_offset = i / 8;
+        let bit_offset = i % 8;
+        let bit = if byte_offset < be.len() {
+            let byte = be[be.len() - 1 - byte_offset];
+            ((byte >> bit_offset) & 1) == 1
+        } else {
+            false
+        };
+        bits.push(bit);
+    }
+    bits
+}
+
+fn selector_sum_pattern(
+    a_row: &SparseRow,
+    b_row: &SparseRow,
+    c_row: &SparseRow,
+) -> Option<Vec<usize>> {
+    if a_row.len() != 1
+        || a_row[0].wire != 0
+        || !a_row[0].coeff.is_one()
+        || c_row.len() != 1
+        || c_row[0].wire != 0
+        || !c_row[0].coeff.is_one()
+        || b_row.is_empty()
+    {
+        return None;
+    }
+
+    let mut selectors = Vec::with_capacity(b_row.len());
+    for term in b_row {
+        if !term.coeff.is_one() {
+            return None;
+        }
+        selectors.push(term.wire as usize);
+    }
+    Some(selectors)
+}
+
+fn selector_index_pattern(
+    a_row: &SparseRow,
+    b_row: &SparseRow,
+    c_row: &SparseRow,
+    selector_wires: &[usize],
+) -> Option<usize> {
+    if a_row.len() != 1
+        || a_row[0].wire != 0
+        || !a_row[0].coeff.is_one()
+        || c_row.len() != 1
+        || !c_row[0].coeff.is_one()
+    {
+        return None;
+    }
+
+    if selector_wires.is_empty() {
+        return None;
+    }
+    // Canonical rows remove zero-coefficient terms, so selector index 0 does not appear.
+    if b_row.len() != selector_wires.len().saturating_sub(1) {
+        return None;
+    }
+
+    for term in b_row {
+        let Some(idx) = selector_wires
+            .iter()
+            .position(|wire| *wire == term.wire as usize)
+        else {
+            return None;
+        };
+        if idx == 0 {
+            return None;
+        }
+        if term.coeff != FieldElement::from(idx as u128) {
+            return None;
+        }
+    }
+
+    for (idx, selector_wire) in selector_wires.iter().enumerate().skip(1) {
+        let Some(term) = b_row
+            .iter()
+            .find(|term| term.wire as usize == *selector_wire)
+        else {
+            return None;
+        };
+        if term.coeff != FieldElement::from(idx as u128) {
+            return None;
+        };
+    }
+
+    Some(c_row[0].wire as usize)
+}
+
+fn field_to_usize(value: FieldElement) -> Option<usize> {
+    let bytes = value.to_be_bytes();
+    let usize_bytes = std::mem::size_of::<usize>();
+    let normalized = if bytes.len() > usize_bytes {
+        let split = bytes.len() - usize_bytes;
+        if bytes[..split].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        bytes[split..].to_vec()
+    } else {
+        bytes
+    };
+
+    let mut out = 0usize;
+    for byte in normalized {
+        out = out.checked_mul(256)?;
+        out = out.checked_add(byte as usize)?;
+    }
+    Some(out)
 }
 
 fn eval_linear_form(
@@ -2943,6 +3270,114 @@ mod tests {
 
         let system = compile_r1cs(&program).expect("8-bit range should compile");
         assert!(system.n_constraints > 0);
+    }
+
+    #[test]
+    fn materialized_witness_satisfies_non_boolean_range_constraints() {
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
+                input: FunctionInput::Witness(Witness(0)),
+                num_bits: 8,
+            })],
+            private_parameters: BTreeSet::from([Witness(0)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("8-bit range should compile");
+        let partial_witness = vec![FieldElement::one(), FieldElement::from(13u128)];
+        assert!(
+            system.is_satisfied(&partial_witness),
+            "materialized witness should satisfy 8-bit range constraints"
+        );
+    }
+
+    #[test]
+    fn materialized_witness_satisfies_multi_bit_and_constraints() {
+        let circuit = Circuit {
+            current_witness_index: 2,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::AND {
+                lhs: FunctionInput::Witness(Witness(0)),
+                rhs: FunctionInput::Witness(Witness(1)),
+                num_bits: 8,
+                output: Witness(2),
+            })],
+            private_parameters: BTreeSet::from([Witness(0), Witness(1), Witness(2)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("8-bit AND should compile");
+        let partial_witness = vec![
+            FieldElement::one(),
+            FieldElement::from(13u128),
+            FieldElement::from(11u128),
+            FieldElement::from(9u128),
+        ];
+        assert!(
+            system.is_satisfied(&partial_witness),
+            "materialized witness should satisfy 8-bit AND constraints"
+        );
+    }
+
+    #[test]
+    fn materialized_witness_satisfies_dynamic_memory_read_constraints() {
+        let circuit = Circuit {
+            current_witness_index: 5,
+            opcodes: vec![
+                Opcode::MemoryInit {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    init: vec![Witness(0), Witness(1), Witness(2), Witness(3)],
+                    block_type: BlockType::Memory,
+                },
+                Opcode::MemoryOp {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    op: MemOp::read_at_mem_index(Expression::from(Witness(4)), Witness(5)),
+                },
+            ],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("dynamic memory read should compile");
+        let partial_witness = vec![
+            FieldElement::one(),
+            FieldElement::from(5u128),
+            FieldElement::from(11u128),
+            FieldElement::from(17u128),
+            FieldElement::from(23u128),
+            FieldElement::from(2u128),
+            FieldElement::from(17u128),
+        ];
+        assert!(
+            system.is_satisfied(&partial_witness),
+            "materialized witness should satisfy dynamic memory read constraints"
+        );
+    }
+
+    #[test]
+    fn field_to_usize_parses_small_values() {
+        assert_eq!(field_to_usize(FieldElement::from(0u128)), Some(0));
+        assert_eq!(field_to_usize(FieldElement::from(2u128)), Some(2));
+        assert_eq!(field_to_usize(FieldElement::from(17u128)), Some(17));
     }
 
     #[test]

@@ -1,0 +1,7 @@
+[package]
+name = "bounded_loop_partial_sum"
+type = "bin"
+authors = ["noir-groth16"]
+compiler_version = ">=1.0.0"
+
+[dependencies]

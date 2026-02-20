@@ -59,3 +59,12 @@ After running `nargo compile` in your Noir project:
 ./target/debug/noir-groth16 interop path/to/target/<package_name>.json path/to/inputs.json --out demo
 ```
 
+## Optional: run the example suite in this repo
+
+To validate all example circuits under `examples/` against this tutorial flow:
+
+```bash
+./examples/run_tutorial_suite.sh
+```
+
+This executes `nargo compile`, `noir-groth16 interop`, `snarkjs wtns check`, and Groth16 prove/verify for each example.
