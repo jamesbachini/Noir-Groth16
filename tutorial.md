@@ -1,78 +1,61 @@
-# Quick tutorial: Groth16 proof for a Noir circuit
+This tutorial shows how to:
+1. Compile a Noir artifact into `circuit.r1cs` and `witness.wtns` with this repo.
+2. Generate a Groth16 proof with `snarkjs`.
 
-This repo’s CLI generates `circuit.r1cs` + `witness.wtns`; `snarkjs` uses those to run Groth16 setup/prove/verify.
-
-## 1) Prereqs
+## 1) Prerequisites
 
 ```bash
-# Rust (for this repo)
 cargo --version
-
-# snarkjs (for Groth16 ceremony/proving)
-npm i -g snarkjs
-
-# optional: Noir compiler (only needed if you want to compile your own .nr circuit)
-nargo --version
+node --version
+npm --version
 ```
 
-## 2) Build the CLI
+Install required CLIs:
+
+```bash
+npm i snarkjs
+cargo install --locked soroban-verifier-gen
+```
+
+## 2) Build `noir-groth16`
 
 ```bash
 cd /mnt/c/code/Noir-Groth16
 cargo build -p noir-cli
 ```
 
-## 3) Generate `.r1cs` and `.wtns`
+## 3) Compile circuit + witness artifacts
 
-Fastest demo (uses included Noir artifact + inputs):
+Use the included fixture artifact and inputs:
 
 ```bash
-./target/debug/noir-groth16 interop \
-  test-vectors/fixture_artifact.json \
-  test-vectors/fixture_inputs.json \
-  --out demo
+./target/debug/noir-groth16 interop test-vectors/fixture_artifact.json \
+  test-vectors/fixture_inputs.json --out demo
 ```
 
-This writes:
+Outputs:
 - `demo/circuit.r1cs`
 - `demo/witness.wtns`
 
-## 4) Run Groth16 with snarkjs
+## 4) Generate a Groth16 proof with `snarkjs`
 
 ```bash
-cd demo
-snarkjs wtns check circuit.r1cs witness.wtns
-snarkjs powersoftau new bn128 12 pot12_0000.ptau -v
-snarkjs powersoftau prepare phase2 pot12_0000.ptau pot12_final.ptau -v
-snarkjs groth16 setup circuit.r1cs pot12_final.ptau circuit_0000.zkey
-snarkjs zkey contribute circuit_0000.zkey circuit_final.zkey --name="demo" -v -e="demo entropy"
-snarkjs zkey export verificationkey circuit_final.zkey verification_key.json
-snarkjs groth16 prove circuit_final.zkey witness.wtns proof.json public.json
-snarkjs groth16 verify verification_key.json public.json proof.json
+cd /mnt/c/code/Noir-Groth16/demo
+npx snarkjs wtns check circuit.r1cs witness.wtns
+npx snarkjs powersoftau new bn128 12 pot12_0000.ptau -v
+npx snarkjs powersoftau prepare phase2 pot12_0000.ptau pot12_final.ptau -v
+npx snarkjs groth16 setup circuit.r1cs pot12_final.ptau circuit_0000.zkey
+npx snarkjs zkey contribute circuit_0000.zkey circuit_final.zkey --name="demo" -v -e="demo entropy"
+npx snarkjs zkey export verificationkey circuit_final.zkey verification_key.json
+npx snarkjs groth16 prove circuit_final.zkey witness.wtns proof.json public.json
+npx snarkjs groth16 verify verification_key.json public.json proof.json
 ```
 
-If verify succeeds, `snarkjs` prints `OK`.
+## Optional: use your own Noir project artifact
 
-## 5) Using your own Noir circuit (optional)
-
-Example circuit (`src/main.nr`):
-
-```rust
-fn main(x: Field, y: pub Field) {
-    assert(x * x == y);
-}
-```
-
-`assert(x != y)` currently lowers through `BrilligCall`, which this repo rejects in strict R1CS lowering.
-
-Compile with Noir (`nargo compile`), then run:
+After running `nargo compile` in your Noir project:
 
 ```bash
-./target/debug/noir-groth16 interop target/<package_name>.json inputs.json --out demo
+./target/debug/noir-groth16 interop path/to/target/<package_name>.json path/to/inputs.json --out demo
 ```
 
-Example `inputs.json` (field elements as strings):
-
-```json
-{"x":"3","y":"9"}
-```
