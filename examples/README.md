@@ -8,6 +8,7 @@ Each example package includes:
 - `inputs.json` (for `noir-groth16 interop`)
 
 Current examples:
+- `demo`
 - `arithmetic_assert`
 - `array_struct_lookup`
 - `blake2s_digest`

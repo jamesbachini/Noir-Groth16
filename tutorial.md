@@ -37,6 +37,9 @@ Outputs:
 - `demo/circuit.r1cs`
 - `demo/witness.wtns`
 
+The bundled Noir demo source for this repo now lives at:
+- `examples/demo/src/main.nr`
+
 ## 4) Generate a Groth16 proof with `snarkjs`
 
 ```bash
@@ -57,6 +60,16 @@ After running `nargo compile` in your Noir project:
 
 ```bash
 ./target/debug/noir-groth16 interop path/to/target/<package_name>.json path/to/inputs.json --out demo
+```
+
+## Optional: compile the bundled `examples/demo` Noir package
+
+```bash
+cd /mnt/c/code/Noir-Groth16/examples/demo
+nargo compile
+cd /mnt/c/code/Noir-Groth16
+./target/debug/noir-groth16 interop examples/demo/target/demo.json \
+  examples/demo/inputs.json --out demo
 ```
 
 ## Optional: run the example suite in this repo

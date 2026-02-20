@@ -1,5 +1,5 @@
 [package]
-name = "zk_sig_commitment"
+name = "demo"
 type = "bin"
 authors = ["James Bachini"]
 compiler_version = ">=0.30.0"
