@@ -13,7 +13,7 @@ use noir_r1cs::{
 use noir_witness::{generate_witness, generate_witness_from_json_str, WitnessArtifacts};
 
 #[derive(Debug, Parser)]
-#[command(name = "noir-groth16")]
+#[command(name = "noir-cli")]
 #[command(about = "Noir ACIR -> witness/R1CS utility CLI")]
 struct Cli {
     #[command(subcommand)]

@@ -22,12 +22,12 @@ require_cmd npx
 
 mkdir -p "${OUT_DIR}" "${OUT_DIR}/interop" "${OUT_DIR}/snarkjs" "${OUT_DIR}/logs"
 
-if [[ ! -x "${ROOT_DIR}/target/debug/noir-groth16" ]]; then
-  echo "Building noir-groth16 CLI..."
+if [[ ! -x "${ROOT_DIR}/target/debug/noir-cli" ]]; then
+  echo "Building noir-cli..."
   cargo build -p noir-cli >/dev/null
 fi
 
-NOIR_CLI="${ROOT_DIR}/target/debug/noir-groth16"
+NOIR_CLI="${ROOT_DIR}/target/debug/noir-cli"
 
 snarkjs() {
   npx -y snarkjs "$@"

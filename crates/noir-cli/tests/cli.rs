@@ -42,7 +42,7 @@ fn witness_command_writes_outputs() {
     let inputs = fixture_path("fixture_inputs.json");
     let out_dir = TempDir::new().expect("temp dir should be created");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+    let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
         .arg("witness")
         .arg(&artifact)
         .arg(&inputs)
@@ -80,7 +80,7 @@ fn r1cs_json_command_writes_json() {
     let out_dir = TempDir::new().expect("temp dir should be created");
     let out_path = out_dir.path().join("circuit.r1cs.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+    let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
         .arg("r1cs-json")
         .arg(&artifact)
         .arg("--out")
@@ -109,7 +109,7 @@ fn witness_command_fails_on_unexpected_input() {
     fs::write(&bad_inputs, r#"{"x":"3","y":"12","unexpected":"999"}"#)
         .expect("bad input file should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+    let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
         .arg("witness")
         .arg(&artifact)
         .arg(&bad_inputs)
@@ -135,7 +135,7 @@ fn r1cs_json_command_supports_memory_mux_fixture() {
     let out_dir = TempDir::new().expect("temp dir should be created");
     let out_path = out_dir.path().join("memory_mux.r1cs.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+    let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
         .arg("r1cs-json")
         .arg(&artifact)
         .arg("--out")
@@ -164,7 +164,7 @@ fn interop_command_is_deterministic_for_blackbox_fixture() {
     let second_out = TempDir::new().expect("second temp dir should be created");
 
     for out in [first_out.path(), second_out.path()] {
-        let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+        let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
             .arg("interop")
             .arg(&artifact)
             .arg(&inputs)
@@ -214,7 +214,7 @@ fn r1cs_json_command_compiles_supported_corpus_fixtures() {
         let out_dir = TempDir::new().expect("temp dir should be created");
         let out_path = out_dir.path().join(format!("{fixture}.r1cs.json"));
 
-        let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+        let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
             .arg("r1cs-json")
             .arg(&artifact)
             .arg("--out")
@@ -248,7 +248,7 @@ fn allow_unsupported_writes_diagnostics_and_still_fails() {
     let out_dir = TempDir::new().expect("temp dir should be created");
     let out_path = out_dir.path().join("unsupported.r1cs.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+    let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
         .arg("r1cs-json")
         .arg(&artifact)
         .arg("--out")

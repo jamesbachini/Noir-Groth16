@@ -1,11 +1,11 @@
 # Noir Example Suite
 
-This directory contains Noir example circuits for validating the `tutorial.md` pipeline end-to-end.
+This directory contains Noir example circuits for validating the README example process end-to-end.
 
 Each example package includes:
 - `Nargo.toml`
 - `src/main.nr`
-- `inputs.json` (for `noir-groth16 interop`)
+- `inputs.json` (for `noir-cli interop`)
 
 Current examples:
 - `demo`
@@ -29,7 +29,7 @@ Current examples:
 - `pedersen_hash`
 - `string_ascii_sum`
 
-## Run the full tutorial pipeline on all examples
+## Run the full example pipeline on all examples
 
 From repository root:
 
@@ -39,7 +39,7 @@ From repository root:
 
 This runs:
 1. `nargo compile` for each example package.
-2. `noir-groth16 interop` to emit `.r1cs` and `.wtns`.
+2. `noir-cli interop` to emit `.r1cs` and `.wtns`.
 3. `snarkjs wtns check`.
 4. `snarkjs groth16 setup/prove/verify`.
 
