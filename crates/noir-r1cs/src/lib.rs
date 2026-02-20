@@ -6,6 +6,7 @@ use std::{
 
 use acir::{
     circuit::{
+        brillig::{BrilligInputs, BrilligOutputs},
         opcodes::{BlackBoxFuncCall, BlockId, FunctionInput, MemOp},
         Circuit, Opcode, OpcodeLocation, Program,
     },
@@ -193,7 +194,15 @@ struct LoweringContext<'a> {
     b_rows: Vec<SparseRow>,
     c_rows: Vec<SparseRow>,
     memory_blocks: BTreeMap<u32, Vec<AcirExpression>>,
+    pending_brillig_outputs: Vec<PendingBrilligOutputConstraint>,
     unsupported: Vec<UnsupportedOpcodeInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingBrilligOutputConstraint {
+    opcode_index: usize,
+    witness: Witness,
+    wire: u32,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -215,6 +224,7 @@ impl<'a> LoweringContext<'a> {
             b_rows: Vec::new(),
             c_rows: Vec::new(),
             memory_blocks: BTreeMap::new(),
+            pending_brillig_outputs: Vec::new(),
             unsupported: Vec::new(),
         }
     }
@@ -225,6 +235,8 @@ impl<'a> LoweringContext<'a> {
         for (index, opcode) in self.circuit.opcodes.iter().enumerate() {
             self.lower_opcode(index, opcode)?;
         }
+
+        self.validate_brillig_output_constraints()?;
 
         if !self.unsupported.is_empty() {
             return Err(R1csError::UnsupportedOpcodes {
@@ -323,11 +335,12 @@ impl<'a> LoweringContext<'a> {
             }
             Opcode::MemoryOp { block_id, op } => self.lower_memory_op(*block_id, op, index),
             Opcode::BlackBoxFuncCall(call) => self.lower_blackbox(call, index),
-            Opcode::BrilligCall { .. } => self.unsupported_opcode(
-                "BrilligCall",
-                index,
-                "Brillig calls are unconstrained by R1CS lowering".to_string(),
-            ),
+            Opcode::BrilligCall {
+                id: _,
+                inputs,
+                outputs,
+                predicate,
+            } => self.lower_brillig_call(inputs, outputs, predicate, index),
             Opcode::Call { .. } => self.unsupported_opcode(
                 "Call",
                 index,
@@ -404,6 +417,66 @@ impl<'a> LoweringContext<'a> {
             },
             other => other,
         })
+    }
+
+    fn lower_brillig_call(
+        &mut self,
+        inputs: &[BrilligInputs<FieldElement>],
+        outputs: &[BrilligOutputs],
+        predicate: &AcirExpression,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        if canonicalize_expression(predicate) != AcirExpression::one() {
+            return self.unsupported_opcode(
+                "BrilligCall",
+                opcode_index,
+                "conditional BrilligCall predicates are unsupported in strict lowering".to_string(),
+            );
+        }
+
+        if outputs.is_empty() {
+            return self.unsupported_opcode(
+                "BrilligCall",
+                opcode_index,
+                "BrilligCall must expose at least one output witness".to_string(),
+            );
+        }
+
+        for input in inputs {
+            match input {
+                BrilligInputs::Single(expr) => {
+                    self.ensure_expression_witnesses_in_range(expr, "BrilligCall input")?;
+                }
+                BrilligInputs::Array(exprs) => {
+                    for expr in exprs {
+                        self.ensure_expression_witnesses_in_range(expr, "BrilligCall array input")?;
+                    }
+                }
+                BrilligInputs::MemoryArray(_) => {}
+            }
+        }
+
+        for output in outputs {
+            match output {
+                BrilligOutputs::Simple(witness) => {
+                    self.register_brillig_output(*witness, opcode_index)?;
+                }
+                BrilligOutputs::Array(witnesses) => {
+                    if witnesses.is_empty() {
+                        return self.unsupported_opcode(
+                            "BrilligCall",
+                            opcode_index,
+                            "BrilligCall output arrays must not be empty".to_string(),
+                        );
+                    }
+                    for witness in witnesses {
+                        self.register_brillig_output(*witness, opcode_index)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn lower_memory_init(
@@ -776,6 +849,45 @@ impl<'a> LoweringContext<'a> {
         Ok(())
     }
 
+    fn register_brillig_output(
+        &mut self,
+        witness: Witness,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        self.ensure_witness_in_range(witness, "BrilligCall output")?;
+        let wire = self.wire_for_witness(witness)?;
+        self.pending_brillig_outputs
+            .push(PendingBrilligOutputConstraint {
+                opcode_index,
+                witness,
+                wire,
+            });
+        Ok(())
+    }
+
+    fn validate_brillig_output_constraints(&mut self) -> Result<(), R1csError> {
+        let mut missing = Vec::new();
+        for output in &self.pending_brillig_outputs {
+            if !self.constrained_wires.contains(&output.wire) {
+                missing.push(*output);
+            }
+        }
+
+        for output in missing {
+            self.unsupported_opcode(
+                "BrilligCall",
+                output.opcode_index,
+                format!(
+                    "Brillig output witness {} (wire {}) is not constrained by lowered R1CS rows",
+                    output.witness.witness_index(),
+                    output.wire
+                ),
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn extract_witness_input(
         &mut self,
         input: &AcirFunctionInput,
@@ -1013,7 +1125,7 @@ mod tests {
 
     use acir::{
         circuit::{
-            brillig::BrilligFunctionId,
+            brillig::{BrilligFunctionId, BrilligInputs, BrilligOutputs},
             opcodes::{AcirFunctionId, BlackBoxFuncCall, BlockType, FunctionInput, MemOp},
             Circuit, Opcode, Program, PublicInputs,
         },
@@ -1166,7 +1278,117 @@ mod tests {
             } => {
                 assert_eq!(opcode, "BrilligCall");
                 assert_eq!(index, 0);
+                assert!(details.contains("at least one output witness"));
                 assert!(details.contains("opcode_variant=BrilligCall"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn brillig_inverse_hint_is_supported_when_outputs_are_constrained() {
+        let circuit = Circuit {
+            current_witness_index: 3,
+            opcodes: vec![
+                Opcode::BrilligCall {
+                    id: BrilligFunctionId(0),
+                    inputs: vec![BrilligInputs::Single(
+                        &Expression::from(Witness(1)) - &Expression::from(Witness(2)),
+                    )],
+                    outputs: vec![BrilligOutputs::Simple(Witness(3))],
+                    predicate: Expression::one(),
+                },
+                Opcode::AssertZero(Expression {
+                    mul_terms: vec![
+                        (FieldElement::one(), Witness(1), Witness(3)),
+                        (-FieldElement::one(), Witness(2), Witness(3)),
+                    ],
+                    linear_combinations: Vec::new(),
+                    q_c: -FieldElement::one(),
+                }),
+            ],
+            private_parameters: BTreeSet::from([Witness(1), Witness(2)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("Brillig inverse hint pattern should compile");
+        let witness = vec![
+            FieldElement::one(),
+            FieldElement::from(3u128),
+            FieldElement::from(2u128),
+            FieldElement::one(),
+        ];
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+    }
+
+    #[test]
+    fn tampered_brillig_inverse_output_fails_constraints() {
+        let circuit = Circuit {
+            current_witness_index: 3,
+            opcodes: vec![
+                Opcode::BrilligCall {
+                    id: BrilligFunctionId(0),
+                    inputs: vec![BrilligInputs::Single(
+                        &Expression::from(Witness(1)) - &Expression::from(Witness(2)),
+                    )],
+                    outputs: vec![BrilligOutputs::Simple(Witness(3))],
+                    predicate: Expression::one(),
+                },
+                Opcode::AssertZero(Expression {
+                    mul_terms: vec![
+                        (FieldElement::one(), Witness(1), Witness(3)),
+                        (-FieldElement::one(), Witness(2), Witness(3)),
+                    ],
+                    linear_combinations: Vec::new(),
+                    q_c: -FieldElement::one(),
+                }),
+            ],
+            private_parameters: BTreeSet::from([Witness(1), Witness(2)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system = compile_r1cs(&program).expect("compile should succeed");
+
+        let tampered = vec![
+            FieldElement::one(),
+            FieldElement::from(3u128),
+            FieldElement::from(2u128),
+            FieldElement::from(2u128),
+        ];
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn non_constant_brillig_predicate_is_unsupported() {
+        let circuit = Circuit {
+            current_witness_index: 2,
+            opcodes: vec![Opcode::BrilligCall {
+                id: BrilligFunctionId(0),
+                inputs: vec![BrilligInputs::Single(Expression::from(Witness(1)))],
+                outputs: vec![BrilligOutputs::Simple(Witness(2))],
+                predicate: Expression::from(Witness(1)),
+            }],
+            ..Circuit::default()
+        };
+
+        let err = compile_r1cs_circuit(&circuit).expect_err("non-constant predicate should fail");
+        match err {
+            R1csError::UnsupportedOpcode {
+                opcode,
+                index,
+                details,
+            } => {
+                assert_eq!(opcode, "BrilligCall");
+                assert_eq!(index, 0);
+                assert!(details.contains("conditional BrilligCall predicates"));
             }
             other => panic!("unexpected error: {other}"),
         }
