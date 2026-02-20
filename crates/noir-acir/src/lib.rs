@@ -62,7 +62,7 @@ pub struct ParameterWitnesses {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Abi {
     pub parameters: Vec<AbiParameter>,
-    pub return_type: Option<AbiType>,
+    pub return_type: Option<AbiReturnType>,
     #[serde(default)]
     pub error_types: BTreeMap<String, Value>,
 }
@@ -80,6 +80,26 @@ pub struct AbiParameter {
 pub enum AbiVisibility {
     Public,
     Private,
+    Databus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AbiReturnType {
+    Direct(AbiType),
+    Wrapped {
+        abi_type: AbiType,
+        visibility: AbiVisibility,
+    },
+}
+
+impl AbiReturnType {
+    pub fn abi_type(&self) -> &AbiType {
+        match self {
+            AbiReturnType::Direct(typ) => typ,
+            AbiReturnType::Wrapped { abi_type, .. } => abi_type,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +183,7 @@ impl Artifact {
             let (source, cursor) = match parameter.visibility {
                 AbiVisibility::Private => (&private, &mut private_cursor),
                 AbiVisibility::Public => (&public, &mut public_cursor),
+                AbiVisibility::Databus => (&private, &mut private_cursor),
             };
 
             if source.len() < *cursor + count {
@@ -486,6 +507,14 @@ impl AbiType {
     pub fn field_count(&self) -> Result<usize, ArtifactError> {
         match self.kind.as_str() {
             "field" | "boolean" | "integer" => Ok(1),
+            "string" => {
+                let len_u64 = self.require_u64("length")?;
+                usize::try_from(len_u64).map_err(|_| {
+                    ArtifactError::InvalidAbiShape(
+                        "ABI string length does not fit usize".to_string(),
+                    )
+                })
+            }
             "array" => {
                 let len_u64 = self.require_u64("length")?;
                 let len = usize::try_from(len_u64).map_err(|_| {
@@ -668,13 +697,41 @@ mod tests {
     #[test]
     fn abi_field_count_rejects_unsupported_kind() {
         let typ = AbiType {
-            kind: "string".to_string(),
+            kind: "binding".to_string(),
             extra: BTreeMap::new(),
         };
 
         let err = typ
             .field_count()
             .expect_err("unsupported type should fail field count");
-        assert!(matches!(err, ArtifactError::UnsupportedAbiType(kind) if kind == "string"));
+        assert!(matches!(err, ArtifactError::UnsupportedAbiType(kind) if kind == "binding"));
+    }
+
+    #[test]
+    fn abi_field_count_supports_string_kind() {
+        let typ: AbiType = serde_json::from_value(serde_json::json!({
+            "kind": "string",
+            "length": 12
+        }))
+        .expect("string ABI type should deserialize");
+        assert_eq!(typ.field_count().expect("string field count"), 12);
+    }
+
+    #[test]
+    fn abi_supports_wrapped_return_type_schema() {
+        let abi: Abi = serde_json::from_value(serde_json::json!({
+            "parameters": [],
+            "return_type": {
+                "abi_type": { "kind": "field" },
+                "visibility": "public"
+            },
+            "error_types": {}
+        }))
+        .expect("ABI should parse wrapped return type");
+
+        let return_type = abi
+            .return_type
+            .expect("wrapped return type should be present");
+        assert_eq!(return_type.abi_type().kind, "field");
     }
 }

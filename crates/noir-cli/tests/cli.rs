@@ -170,6 +170,47 @@ fn interop_command_is_deterministic_for_blackbox_fixture() {
 }
 
 #[test]
+fn r1cs_json_command_compiles_supported_corpus_fixtures() {
+    let fixtures = [
+        "fixture_artifact.json",
+        "memory_mux_artifact.json",
+        "blackbox_bool_artifact.json",
+    ];
+
+    for fixture in fixtures {
+        let artifact = fixture_path(fixture);
+        let out_dir = TempDir::new().expect("temp dir should be created");
+        let out_path = out_dir.path().join(format!("{fixture}.r1cs.json"));
+
+        let output = Command::new(env!("CARGO_BIN_EXE_noir-groth16"))
+            .arg("r1cs-json")
+            .arg(&artifact)
+            .arg("--out")
+            .arg(&out_path)
+            .output()
+            .expect("r1cs-json command should execute");
+
+        assert!(
+            output.status.success(),
+            "r1cs-json failed for fixture {fixture}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let raw = fs::read_to_string(&out_path).expect("r1cs json should be written");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("r1cs json should parse");
+        assert!(
+            parsed.get("n_wires").is_some(),
+            "missing n_wires for {fixture}"
+        );
+        assert!(
+            parsed.get("n_constraints").is_some(),
+            "missing n_constraints for {fixture}"
+        );
+    }
+}
+
+#[test]
 fn allow_unsupported_writes_diagnostics_and_still_fails() {
     let artifact = fixture_path("unsupported_brillig_artifact.json");
     let out_dir = TempDir::new().expect("temp dir should be created");

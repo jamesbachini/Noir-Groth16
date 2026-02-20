@@ -211,6 +211,34 @@ fn flatten_value_for_type(typ: &AbiType, value: &Value) -> Result<Vec<FieldEleme
             })?;
             Ok(vec![FieldElement::from(b)])
         }
+        "string" => {
+            let len_u64 = typ
+                .extra
+                .get("length")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    WitnessError::UnsupportedAbiType("string missing length".to_string())
+                })?;
+            let len = usize::try_from(len_u64).map_err(|_| {
+                WitnessError::UnsupportedAbiType("string length does not fit usize".to_string())
+            })?;
+
+            let string = value.as_str().ok_or_else(|| {
+                WitnessError::InvalidFieldValue(format!("expected string, got {value}"))
+            })?;
+            let bytes = string.as_bytes();
+            if bytes.len() != len {
+                return Err(WitnessError::InvalidFieldValue(format!(
+                    "string length mismatch: expected {len}, got {}",
+                    bytes.len()
+                )));
+            }
+
+            Ok(bytes
+                .iter()
+                .map(|byte| FieldElement::from(u128::from(*byte)))
+                .collect())
+        }
         "array" => {
             let len_u64 = typ
                 .extra
@@ -579,6 +607,90 @@ mod tests {
         let err = generate_witness(&artifact, &inputs)
             .expect_err("unexpected struct field should fail witness generation");
         assert!(matches!(err, WitnessError::UnexpectedStructField(field) if field == "extra"));
+    }
+
+    #[test]
+    fn supports_string_abi_inputs() {
+        let string_type: AbiType = serde_json::from_value(serde_json::json!({
+            "kind": "string",
+            "length": 3
+        }))
+        .expect("string ABI type should parse");
+
+        let circuit = Circuit {
+            current_witness_index: 3,
+            private_parameters: BTreeSet::from([Witness(1), Witness(2), Witness(3)]),
+            ..Circuit::default()
+        };
+        let artifact = Artifact {
+            noir_version: None,
+            abi: noir_acir::Abi {
+                parameters: vec![noir_acir::AbiParameter {
+                    name: "msg".to_string(),
+                    typ: string_type,
+                    visibility: noir_acir::AbiVisibility::Private,
+                }],
+                return_type: None,
+                error_types: BTreeMap::new(),
+            },
+            program: Program {
+                functions: vec![circuit],
+                unconstrained_functions: vec![],
+            },
+            program_bytes: Vec::new(),
+        };
+
+        let inputs = serde_json::json!({ "msg": "cat" });
+        let witness = generate_witness(&artifact, &inputs).expect("string ABI should flatten");
+        assert_eq!(
+            witness.witness_map.get_index(1),
+            Some(&FieldElement::from(u128::from(b'c')))
+        );
+        assert_eq!(
+            witness.witness_map.get_index(2),
+            Some(&FieldElement::from(u128::from(b'a')))
+        );
+        assert_eq!(
+            witness.witness_map.get_index(3),
+            Some(&FieldElement::from(u128::from(b't')))
+        );
+    }
+
+    #[test]
+    fn rejects_string_abi_length_mismatch() {
+        let string_type: AbiType = serde_json::from_value(serde_json::json!({
+            "kind": "string",
+            "length": 4
+        }))
+        .expect("string ABI type should parse");
+
+        let circuit = Circuit {
+            current_witness_index: 4,
+            private_parameters: BTreeSet::from([Witness(1), Witness(2), Witness(3), Witness(4)]),
+            ..Circuit::default()
+        };
+        let artifact = Artifact {
+            noir_version: None,
+            abi: noir_acir::Abi {
+                parameters: vec![noir_acir::AbiParameter {
+                    name: "msg".to_string(),
+                    typ: string_type,
+                    visibility: noir_acir::AbiVisibility::Private,
+                }],
+                return_type: None,
+                error_types: BTreeMap::new(),
+            },
+            program: Program {
+                functions: vec![circuit],
+                unconstrained_functions: vec![],
+            },
+            program_bytes: Vec::new(),
+        };
+
+        let inputs = serde_json::json!({ "msg": "cat" });
+        let err =
+            generate_witness(&artifact, &inputs).expect_err("string length mismatch should fail");
+        assert!(matches!(err, WitnessError::InvalidFieldValue(name) if name == "msg"));
     }
 
     #[test]
