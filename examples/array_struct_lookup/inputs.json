@@ -1,0 +1,1 @@
+{"entries":[{"balance":"10","active":true},{"balance":"20","active":false},{"balance":"33","active":true}],"idx":"2","expected":"33"}

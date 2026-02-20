@@ -1683,6 +1683,9 @@ impl<'a> LoweringContext<'a> {
         let mut missing = Vec::new();
         for output in &self.pending_hint_outputs {
             if !self.wire_is_constrained_outside_hint_plumbing(output.wire) {
+                if !self.wire_is_referenced_in_any_row(output.wire) {
+                    continue;
+                }
                 missing.push(*output);
             }
         }
@@ -1730,6 +1733,20 @@ impl<'a> LoweringContext<'a> {
                 return true;
             }
             if self.c_rows[row_idx].iter().any(|term| term.wire == wire) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn wire_is_referenced_in_any_row(&self, wire: u32) -> bool {
+        for row in self
+            .a_rows
+            .iter()
+            .chain(self.b_rows.iter())
+            .chain(self.c_rows.iter())
+        {
+            if row.iter().any(|term| term.wire == wire) {
                 return true;
             }
         }
@@ -2210,12 +2227,9 @@ fn selector_index_pattern(
     }
 
     for term in b_row {
-        let Some(idx) = selector_wires
+        let idx = selector_wires
             .iter()
-            .position(|wire| *wire == term.wire as usize)
-        else {
-            return None;
-        };
+            .position(|wire| *wire == term.wire as usize)?;
         if idx == 0 {
             return None;
         }
@@ -2225,12 +2239,9 @@ fn selector_index_pattern(
     }
 
     for (idx, selector_wire) in selector_wires.iter().enumerate().skip(1) {
-        let Some(term) = b_row
+        let term = b_row
             .iter()
-            .find(|term| term.wire as usize == *selector_wire)
-        else {
-            return None;
-        };
+            .find(|term| term.wire as usize == *selector_wire)?;
         if term.coeff != FieldElement::from(idx as u128) {
             return None;
         };
@@ -3042,6 +3053,57 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn dead_hint_outputs_are_ignored_when_other_outputs_are_constrained() {
+        let circuit = Circuit {
+            current_witness_index: 8,
+            opcodes: vec![
+                Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Poseidon2Permutation {
+                    inputs: vec![
+                        FunctionInput::Witness(Witness(1)),
+                        FunctionInput::Witness(Witness(2)),
+                        FunctionInput::Witness(Witness(3)),
+                        FunctionInput::Witness(Witness(4)),
+                    ],
+                    outputs: vec![Witness(5), Witness(6), Witness(7), Witness(8)],
+                }),
+                Opcode::AssertZero(Expression {
+                    mul_terms: Vec::new(),
+                    linear_combinations: vec![
+                        (FieldElement::one(), Witness(5)),
+                        (-FieldElement::one(), Witness(1)),
+                    ],
+                    q_c: FieldElement::zero(),
+                }),
+            ],
+            private_parameters: BTreeSet::from([Witness(1), Witness(2), Witness(3), Witness(4)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("dead hint outputs should be allowed");
+        let witness = vec![
+            FieldElement::one(),
+            FieldElement::zero(),
+            FieldElement::from(5u128),
+            FieldElement::from(2u128),
+            FieldElement::from(3u128),
+            FieldElement::from(4u128),
+            FieldElement::from(5u128),
+            FieldElement::from(99u128),
+            FieldElement::from(55u128),
+            FieldElement::from(77u128),
+        ];
+        assert!(system.is_satisfied(&witness));
+
+        let mut tampered = witness.clone();
+        tampered[6] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
     }
 
     #[test]
