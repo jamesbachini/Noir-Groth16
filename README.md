@@ -153,6 +153,15 @@ The table below tracks opcode coverage in `crates/noir-r1cs`.
 - Strict mode (default): unsupported/underconstrained behavior is an error.
 - Diagnostics mode (`--allow-unsupported`): still fails compilation, but emits coverage diagnostics and does **not** emit `.r1cs`/`.wtns`.
 
+## Validation Checks
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test -p noir-r1cs
+cargo test --workspace
+```
+
 ## Disclaimer
 
 Please note code is experimental in nature and not currently suitable for production.
