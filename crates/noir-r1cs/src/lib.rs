@@ -19,6 +19,8 @@ use r1cs_file::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod poseidon2_constants;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoweringMode {
     Strict,
@@ -220,6 +222,12 @@ struct PendingHintOutputConstraint {
     opcode_index: usize,
     witness: Witness,
     wire: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedBlackBoxPredicate {
+    Constant(bool),
+    Wire(u32),
 }
 
 impl<'a> LoweringContext<'a> {
@@ -1273,6 +1281,15 @@ impl<'a> LoweringContext<'a> {
             BlackBoxFuncCall::RANGE { input, num_bits } => {
                 self.lower_range(input, *num_bits, opcode_index)
             }
+            BlackBoxFuncCall::Poseidon2Permutation { inputs, outputs } => {
+                self.lower_poseidon2_permutation(inputs, outputs, opcode_index)
+            }
+            BlackBoxFuncCall::EmbeddedCurveAdd {
+                input1,
+                input2,
+                predicate,
+                outputs,
+            } => self.lower_embedded_curve_add(input1, input2, predicate, *outputs, opcode_index),
             other => self.lower_blackbox_as_hint(other, opcode_index),
         }
     }
@@ -1428,6 +1445,656 @@ impl<'a> LoweringContext<'a> {
             "BlackBoxFuncCall::RANGE input",
         )?;
         Ok(())
+    }
+
+    fn lower_poseidon2_permutation(
+        &mut self,
+        inputs: &[AcirFunctionInput],
+        outputs: &[Witness],
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        if inputs.len() != outputs.len() {
+            return self.unsupported_opcode(
+                "BlackBoxFuncCall",
+                opcode_index,
+                format!(
+                    "Poseidon2Permutation input/output arity mismatch: {} inputs vs {} outputs",
+                    inputs.len(),
+                    outputs.len()
+                ),
+            );
+        }
+
+        let config = &*poseidon2_constants::POSEIDON2_CONFIG;
+        let expected_width = config.t as usize;
+        if inputs.len() != expected_width {
+            return self.unsupported_opcode(
+                "BlackBoxFuncCall",
+                opcode_index,
+                format!(
+                    "Poseidon2Permutation expects exactly {expected_width} state elements, found {}",
+                    inputs.len()
+                ),
+            );
+        }
+
+        let mut state = [0u32; 4];
+        for (index, input) in inputs.iter().enumerate() {
+            state[index] = self.resolve_blackbox_function_input_wire(
+                input,
+                "BlackBoxFuncCall::Poseidon2Permutation input",
+            )?;
+        }
+
+        let mut output_wires = [0u32; 4];
+        for (index, output) in outputs.iter().enumerate() {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Poseidon2Permutation output")?;
+            output_wires[index] = self.wire_for_witness(*output)?;
+        }
+
+        state = self.poseidon2_matrix_multiplication_4x4(state)?;
+
+        let full_round_half = (config.rounds_f / 2) as usize;
+        for round in 0..full_round_half {
+            self.poseidon2_add_round_constants(&mut state, &config.round_constant[round])?;
+            self.poseidon2_sbox(&mut state)?;
+            state = self.poseidon2_matrix_multiplication_4x4(state)?;
+        }
+
+        let partial_round_end = full_round_half + config.rounds_p as usize;
+        for round in full_round_half..partial_round_end {
+            state[0] = self.add_constant_to_wire(state[0], config.round_constant[round][0])?;
+            state[0] = self.poseidon2_single_box(state[0])?;
+            state = self.poseidon2_internal_m_multiplication(state)?;
+        }
+
+        let total_rounds = (config.rounds_f + config.rounds_p) as usize;
+        for round in partial_round_end..total_rounds {
+            self.poseidon2_add_round_constants(&mut state, &config.round_constant[round])?;
+            self.poseidon2_sbox(&mut state)?;
+            state = self.poseidon2_matrix_multiplication_4x4(state)?;
+        }
+
+        for (state_wire, output_wire) in state.into_iter().zip(output_wires) {
+            self.enforce_wire_equality(state_wire, output_wire)?;
+        }
+
+        Ok(())
+    }
+
+    fn resolve_blackbox_function_input_wire(
+        &mut self,
+        input: &AcirFunctionInput,
+        context: &str,
+    ) -> Result<u32, R1csError> {
+        match input {
+            FunctionInput::Witness(witness) => {
+                self.ensure_witness_in_range(*witness, context)?;
+                self.wire_for_witness(*witness)
+            }
+            FunctionInput::Constant(value) => {
+                self.constrain_linear_combination_to_new_wire(&[], *value)
+            }
+        }
+    }
+
+    fn multiply_wires(&mut self, lhs_wire: u32, rhs_wire: u32) -> Result<u32, R1csError> {
+        let output_wire = self.allocate_intermediate_wire();
+        self.emit_constraint(
+            vec![SparseTerm {
+                wire: lhs_wire,
+                coeff: FieldElement::one(),
+            }],
+            vec![SparseTerm {
+                wire: rhs_wire,
+                coeff: FieldElement::one(),
+            }],
+            vec![SparseTerm {
+                wire: output_wire,
+                coeff: FieldElement::one(),
+            }],
+        )?;
+        Ok(output_wire)
+    }
+
+    fn add_constant_to_wire(
+        &mut self,
+        wire: u32,
+        constant: FieldElement,
+    ) -> Result<u32, R1csError> {
+        if constant.is_zero() {
+            return Ok(wire);
+        }
+        self.constrain_linear_combination_to_new_wire(&[(wire, FieldElement::one())], constant)
+    }
+
+    fn constrain_linear_combination_to_new_wire(
+        &mut self,
+        terms: &[(u32, FieldElement)],
+        constant: FieldElement,
+    ) -> Result<u32, R1csError> {
+        let output_wire = self.allocate_intermediate_wire();
+        let mut linear_terms: BTreeMap<u32, FieldElement> = BTreeMap::new();
+        for (wire, coeff) in terms {
+            if coeff.is_zero() {
+                continue;
+            }
+            add_linear(&mut linear_terms, *wire, *coeff);
+        }
+        if !constant.is_zero() {
+            add_linear(&mut linear_terms, 0, constant);
+        }
+
+        self.emit_constraint(
+            vec![SparseTerm {
+                wire: 0,
+                coeff: FieldElement::one(),
+            }],
+            linear_terms
+                .into_iter()
+                .map(|(wire, coeff)| SparseTerm { wire, coeff })
+                .collect(),
+            vec![SparseTerm {
+                wire: output_wire,
+                coeff: FieldElement::one(),
+            }],
+        )?;
+        Ok(output_wire)
+    }
+
+    fn enforce_wire_equality(&mut self, lhs_wire: u32, rhs_wire: u32) -> Result<(), R1csError> {
+        self.emit_constraint(
+            vec![SparseTerm {
+                wire: 0,
+                coeff: FieldElement::one(),
+            }],
+            vec![
+                SparseTerm {
+                    wire: lhs_wire,
+                    coeff: FieldElement::one(),
+                },
+                SparseTerm {
+                    wire: rhs_wire,
+                    coeff: -FieldElement::one(),
+                },
+            ],
+            Vec::new(),
+        )
+    }
+
+    fn poseidon2_single_box(&mut self, input_wire: u32) -> Result<u32, R1csError> {
+        let square_wire = self.multiply_wires(input_wire, input_wire)?;
+        let quad_wire = self.multiply_wires(square_wire, square_wire)?;
+        self.multiply_wires(quad_wire, input_wire)
+    }
+
+    fn poseidon2_sbox(&mut self, state: &mut [u32; 4]) -> Result<(), R1csError> {
+        for state_wire in state.iter_mut() {
+            *state_wire = self.poseidon2_single_box(*state_wire)?;
+        }
+        Ok(())
+    }
+
+    fn poseidon2_add_round_constants(
+        &mut self,
+        state: &mut [u32; 4],
+        round_constants: &[FieldElement; 4],
+    ) -> Result<(), R1csError> {
+        for (state_wire, constant) in state.iter_mut().zip(round_constants.iter()) {
+            *state_wire = self.add_constant_to_wire(*state_wire, *constant)?;
+        }
+        Ok(())
+    }
+
+    fn poseidon2_matrix_multiplication_4x4(
+        &mut self,
+        state: [u32; 4],
+    ) -> Result<[u32; 4], R1csError> {
+        let one = FieldElement::one();
+        let two = FieldElement::from(2u128);
+        let four = FieldElement::from(4u128);
+
+        let t0 = self.constrain_linear_combination_to_new_wire(
+            &[(state[0], one), (state[1], one)],
+            FieldElement::zero(),
+        )?;
+        let t1 = self.constrain_linear_combination_to_new_wire(
+            &[(state[2], one), (state[3], one)],
+            FieldElement::zero(),
+        )?;
+        let t2 = self.constrain_linear_combination_to_new_wire(
+            &[(state[1], two), (t1, one)],
+            FieldElement::zero(),
+        )?;
+        let t3 = self.constrain_linear_combination_to_new_wire(
+            &[(state[3], two), (t0, one)],
+            FieldElement::zero(),
+        )?;
+        let t4 = self.constrain_linear_combination_to_new_wire(
+            &[(t1, four), (t3, one)],
+            FieldElement::zero(),
+        )?;
+        let t5 = self.constrain_linear_combination_to_new_wire(
+            &[(t0, four), (t2, one)],
+            FieldElement::zero(),
+        )?;
+        let t6 = self.constrain_linear_combination_to_new_wire(
+            &[(t3, one), (t5, one)],
+            FieldElement::zero(),
+        )?;
+        let t7 = self.constrain_linear_combination_to_new_wire(
+            &[(t2, one), (t4, one)],
+            FieldElement::zero(),
+        )?;
+        Ok([t6, t5, t7, t4])
+    }
+
+    fn poseidon2_internal_m_multiplication(
+        &mut self,
+        state: [u32; 4],
+    ) -> Result<[u32; 4], R1csError> {
+        let one = FieldElement::one();
+        let sum_wire = self.constrain_linear_combination_to_new_wire(
+            &[
+                (state[0], one),
+                (state[1], one),
+                (state[2], one),
+                (state[3], one),
+            ],
+            FieldElement::zero(),
+        )?;
+        let diagonal = &poseidon2_constants::POSEIDON2_CONFIG.internal_matrix_diagonal;
+        Ok([
+            self.constrain_linear_combination_to_new_wire(
+                &[(state[0], diagonal[0]), (sum_wire, one)],
+                FieldElement::zero(),
+            )?,
+            self.constrain_linear_combination_to_new_wire(
+                &[(state[1], diagonal[1]), (sum_wire, one)],
+                FieldElement::zero(),
+            )?,
+            self.constrain_linear_combination_to_new_wire(
+                &[(state[2], diagonal[2]), (sum_wire, one)],
+                FieldElement::zero(),
+            )?,
+            self.constrain_linear_combination_to_new_wire(
+                &[(state[3], diagonal[3]), (sum_wire, one)],
+                FieldElement::zero(),
+            )?,
+        ])
+    }
+
+    fn lower_embedded_curve_add(
+        &mut self,
+        input1: &[AcirFunctionInput; 3],
+        input2: &[AcirFunctionInput; 3],
+        predicate: &AcirFunctionInput,
+        outputs: (Witness, Witness, Witness),
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let output_witnesses = [outputs.0, outputs.1, outputs.2];
+        let mut output_wires = [0u32; 3];
+        for (index, output) in output_witnesses.iter().enumerate() {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::EmbeddedCurveAdd output")?;
+            output_wires[index] = self.wire_for_witness(*output)?;
+        }
+        let output_x_wire = output_wires[0];
+        let output_y_wire = output_wires[1];
+        let output_infinite_wire = output_wires[2];
+
+        let predicate = self.resolve_blackbox_predicate(
+            predicate,
+            opcode_index,
+            "BlackBoxFuncCall::EmbeddedCurveAdd predicate",
+        )?;
+        if matches!(predicate, ResolvedBlackBoxPredicate::Constant(false)) {
+            self.enforce_wire_equals_constant(output_x_wire, FieldElement::zero())?;
+            self.enforce_wire_equals_constant(output_y_wire, FieldElement::zero())?;
+            self.enforce_wire_equals_constant(output_infinite_wire, FieldElement::one())?;
+            return Ok(());
+        }
+
+        let predicate_wire = match predicate {
+            ResolvedBlackBoxPredicate::Constant(true) => 0,
+            ResolvedBlackBoxPredicate::Wire(wire) => wire,
+            ResolvedBlackBoxPredicate::Constant(false) => unreachable!(),
+        };
+        if let ResolvedBlackBoxPredicate::Wire(wire) = predicate {
+            let one_minus_predicate = self.boolean_not_wire(wire)?;
+            self.enforce_selector_times_linear_zero(
+                one_minus_predicate,
+                &[(output_x_wire, FieldElement::one())],
+                FieldElement::zero(),
+            )?;
+            self.enforce_selector_times_linear_zero(
+                one_minus_predicate,
+                &[(output_y_wire, FieldElement::one())],
+                FieldElement::zero(),
+            )?;
+            self.enforce_selector_times_linear_zero(
+                one_minus_predicate,
+                &[(output_infinite_wire, FieldElement::one())],
+                -FieldElement::one(),
+            )?;
+        }
+
+        let input1_x = self.resolve_blackbox_function_input_wire(
+            input1.first().expect("input1 x is present"),
+            "BlackBoxFuncCall::EmbeddedCurveAdd input1.x",
+        )?;
+        let input1_y = self.resolve_blackbox_function_input_wire(
+            input1.get(1).expect("input1 y is present"),
+            "BlackBoxFuncCall::EmbeddedCurveAdd input1.y",
+        )?;
+        let input1_infinite = self.resolve_blackbox_function_input_wire(
+            input1.get(2).expect("input1 infinite is present"),
+            "BlackBoxFuncCall::EmbeddedCurveAdd input1.is_infinite",
+        )?;
+        let input2_x = self.resolve_blackbox_function_input_wire(
+            input2.first().expect("input2 x is present"),
+            "BlackBoxFuncCall::EmbeddedCurveAdd input2.x",
+        )?;
+        let input2_y = self.resolve_blackbox_function_input_wire(
+            input2.get(1).expect("input2 y is present"),
+            "BlackBoxFuncCall::EmbeddedCurveAdd input2.y",
+        )?;
+        let input2_infinite = self.resolve_blackbox_function_input_wire(
+            input2.get(2).expect("input2 infinite is present"),
+            "BlackBoxFuncCall::EmbeddedCurveAdd input2.is_infinite",
+        )?;
+
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[(input1_infinite, FieldElement::one())],
+            FieldElement::zero(),
+        )?;
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[(input2_infinite, FieldElement::one())],
+            FieldElement::zero(),
+        )?;
+
+        let input1_y_squared = self.multiply_wires(input1_y, input1_y)?;
+        let input1_x_squared = self.multiply_wires(input1_x, input1_x)?;
+        let input1_x_cubed = self.multiply_wires(input1_x_squared, input1_x)?;
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[
+                (input1_y_squared, FieldElement::one()),
+                (input1_x_cubed, -FieldElement::one()),
+            ],
+            FieldElement::from(17u128),
+        )?;
+
+        let input2_y_squared = self.multiply_wires(input2_y, input2_y)?;
+        let input2_x_squared = self.multiply_wires(input2_x, input2_x)?;
+        let input2_x_cubed = self.multiply_wires(input2_x_squared, input2_x)?;
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[
+                (input2_y_squared, FieldElement::one()),
+                (input2_x_cubed, -FieldElement::one()),
+            ],
+            FieldElement::from(17u128),
+        )?;
+
+        let same_x = self.equality_indicator_wire(input1_x, input2_x)?;
+        let same_y = self.equality_indicator_wire(input1_y, input2_y)?;
+        let y_sum = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input1_y, FieldElement::one()),
+                (input2_y, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+        let opposite_y = self.equality_indicator_wire(y_sum, zero_wire)?;
+
+        let expected_output_infinite = self.boolean_and_wires(same_x, opposite_y)?;
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[
+                (output_infinite_wire, FieldElement::one()),
+                (expected_output_infinite, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        let one_minus_expected_output_infinite = self.boolean_not_wire(expected_output_infinite)?;
+        let finite_selector =
+            self.multiply_wires(predicate_wire, one_minus_expected_output_infinite)?;
+        self.enforce_boolean_wire(finite_selector)?;
+        let infinite_selector = self.multiply_wires(predicate_wire, expected_output_infinite)?;
+        self.enforce_boolean_wire(infinite_selector)?;
+
+        let is_double = self.boolean_and_wires(same_x, same_y)?;
+        let one_minus_is_double = self.boolean_not_wire(is_double)?;
+        let add_selector = self.multiply_wires(finite_selector, one_minus_is_double)?;
+        self.enforce_boolean_wire(add_selector)?;
+        let double_selector = self.multiply_wires(finite_selector, is_double)?;
+        self.enforce_boolean_wire(double_selector)?;
+
+        let x2_minus_x1 = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input2_x, FieldElement::one()),
+                (input1_x, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let add_denominator_inverse = self.allocate_intermediate_wire();
+        let add_denominator_inverse_check =
+            self.multiply_wires(x2_minus_x1, add_denominator_inverse)?;
+        self.enforce_selector_times_linear_zero(
+            add_selector,
+            &[(add_denominator_inverse_check, FieldElement::one())],
+            -FieldElement::one(),
+        )?;
+        let y2_minus_y1 = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input2_y, FieldElement::one()),
+                (input1_y, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let add_lambda = self.multiply_wires(y2_minus_y1, add_denominator_inverse)?;
+
+        let two_y1 = self.constrain_linear_combination_to_new_wire(
+            &[(input1_y, FieldElement::from(2u128))],
+            FieldElement::zero(),
+        )?;
+        let double_denominator_inverse = self.allocate_intermediate_wire();
+        let double_denominator_inverse_check =
+            self.multiply_wires(two_y1, double_denominator_inverse)?;
+        self.enforce_selector_times_linear_zero(
+            double_selector,
+            &[(double_denominator_inverse_check, FieldElement::one())],
+            -FieldElement::one(),
+        )?;
+        let three_x1_squared = self.constrain_linear_combination_to_new_wire(
+            &[(input1_x_squared, FieldElement::from(3u128))],
+            FieldElement::zero(),
+        )?;
+        let double_lambda = self.multiply_wires(three_x1_squared, double_denominator_inverse)?;
+
+        let add_lambda_squared = self.multiply_wires(add_lambda, add_lambda)?;
+        self.enforce_selector_times_linear_zero(
+            add_selector,
+            &[
+                (output_x_wire, FieldElement::one()),
+                (add_lambda_squared, -FieldElement::one()),
+                (input1_x, FieldElement::one()),
+                (input2_x, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let input1_x_minus_output_x = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input1_x, FieldElement::one()),
+                (output_x_wire, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let add_y_intermediate = self.multiply_wires(add_lambda, input1_x_minus_output_x)?;
+        self.enforce_selector_times_linear_zero(
+            add_selector,
+            &[
+                (output_y_wire, FieldElement::one()),
+                (add_y_intermediate, -FieldElement::one()),
+                (input1_y, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        let double_lambda_squared = self.multiply_wires(double_lambda, double_lambda)?;
+        self.enforce_selector_times_linear_zero(
+            double_selector,
+            &[
+                (output_x_wire, FieldElement::one()),
+                (double_lambda_squared, -FieldElement::one()),
+                (input1_x, FieldElement::from(2u128)),
+            ],
+            FieldElement::zero(),
+        )?;
+        let double_y_intermediate = self.multiply_wires(double_lambda, input1_x_minus_output_x)?;
+        self.enforce_selector_times_linear_zero(
+            double_selector,
+            &[
+                (output_y_wire, FieldElement::one()),
+                (double_y_intermediate, -FieldElement::one()),
+                (input1_y, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        self.enforce_selector_times_linear_zero(
+            infinite_selector,
+            &[(output_x_wire, FieldElement::one())],
+            FieldElement::zero(),
+        )?;
+        self.enforce_selector_times_linear_zero(
+            infinite_selector,
+            &[(output_y_wire, FieldElement::one())],
+            FieldElement::zero(),
+        )?;
+
+        Ok(())
+    }
+
+    fn resolve_blackbox_predicate(
+        &mut self,
+        predicate: &AcirFunctionInput,
+        opcode_index: usize,
+        context: &str,
+    ) -> Result<ResolvedBlackBoxPredicate, R1csError> {
+        match predicate {
+            FunctionInput::Constant(value) if value.is_zero() => {
+                Ok(ResolvedBlackBoxPredicate::Constant(false))
+            }
+            FunctionInput::Constant(value) if value.is_one() => {
+                Ok(ResolvedBlackBoxPredicate::Constant(true))
+            }
+            FunctionInput::Constant(value) => {
+                self.unsupported_opcode(
+                    "BlackBoxFuncCall",
+                    opcode_index,
+                    format!("{context} must be 0 or 1, found {value}"),
+                )?;
+                Ok(ResolvedBlackBoxPredicate::Constant(false))
+            }
+            FunctionInput::Witness(witness) => {
+                self.ensure_witness_in_range(*witness, context)?;
+                let predicate_wire = self.wire_for_witness(*witness)?;
+                self.enforce_boolean_wire(predicate_wire)?;
+                Ok(ResolvedBlackBoxPredicate::Wire(predicate_wire))
+            }
+        }
+    }
+
+    fn enforce_wire_equals_constant(
+        &mut self,
+        wire: u32,
+        constant: FieldElement,
+    ) -> Result<(), R1csError> {
+        self.enforce_selector_times_linear_zero(0, &[(wire, FieldElement::one())], -constant)
+    }
+
+    fn enforce_selector_times_linear_zero(
+        &mut self,
+        selector_wire: u32,
+        terms: &[(u32, FieldElement)],
+        constant: FieldElement,
+    ) -> Result<(), R1csError> {
+        let mut linear_terms: BTreeMap<u32, FieldElement> = BTreeMap::new();
+        for (wire, coeff) in terms {
+            if coeff.is_zero() {
+                continue;
+            }
+            add_linear(&mut linear_terms, *wire, *coeff);
+        }
+        if !constant.is_zero() {
+            add_linear(&mut linear_terms, 0, constant);
+        }
+        self.emit_constraint(
+            vec![SparseTerm {
+                wire: selector_wire,
+                coeff: FieldElement::one(),
+            }],
+            linear_terms
+                .into_iter()
+                .map(|(wire, coeff)| SparseTerm { wire, coeff })
+                .collect(),
+            Vec::new(),
+        )
+    }
+
+    fn equality_indicator_wire(&mut self, lhs_wire: u32, rhs_wire: u32) -> Result<u32, R1csError> {
+        let difference_wire = self.constrain_linear_combination_to_new_wire(
+            &[
+                (lhs_wire, FieldElement::one()),
+                (rhs_wire, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let inverse_wire = self.allocate_intermediate_wire();
+        let is_equal_wire = self.allocate_intermediate_wire();
+        self.enforce_boolean_wire(is_equal_wire)?;
+
+        let difference_times_inverse = self.multiply_wires(difference_wire, inverse_wire)?;
+        self.enforce_selector_times_linear_zero(
+            0,
+            &[
+                (difference_times_inverse, FieldElement::one()),
+                (is_equal_wire, FieldElement::one()),
+            ],
+            -FieldElement::one(),
+        )?;
+        self.emit_constraint(
+            vec![SparseTerm {
+                wire: difference_wire,
+                coeff: FieldElement::one(),
+            }],
+            vec![SparseTerm {
+                wire: is_equal_wire,
+                coeff: FieldElement::one(),
+            }],
+            Vec::new(),
+        )?;
+        Ok(is_equal_wire)
+    }
+
+    fn boolean_and_wires(&mut self, lhs_wire: u32, rhs_wire: u32) -> Result<u32, R1csError> {
+        let and_wire = self.multiply_wires(lhs_wire, rhs_wire)?;
+        self.enforce_boolean_wire(and_wire)?;
+        Ok(and_wire)
+    }
+
+    fn boolean_not_wire(&mut self, wire: u32) -> Result<u32, R1csError> {
+        let one_minus_wire = self.constrain_linear_combination_to_new_wire(
+            &[(wire, -FieldElement::one())],
+            FieldElement::one(),
+        )?;
+        self.enforce_boolean_wire(one_minus_wire)?;
+        Ok(one_minus_wire)
     }
 
     fn lower_blackbox_as_hint(
@@ -2932,13 +3599,14 @@ mod tests {
         native_types::{Expression, Witness},
         FieldElement,
     };
+    use bn254_blackbox_solver::embedded_curve_add;
     use noir_acir::Artifact;
-    use noir_witness::generate_witness_from_json_str;
+    use noir_witness::{generate_witness_from_json_str, poseidon2_permutation};
     use proptest::prelude::*;
     use r1cs_file::R1csFile;
     use tempfile::TempDir;
 
-    use super::*;
+    use super::{poseidon2_constants::field_from_hex, *};
 
     fn assert_r1cs_satisfied(system: &R1csSystem, witness: &[FieldElement]) {
         let full = system
@@ -3236,29 +3904,21 @@ mod tests {
     }
 
     #[test]
-    fn dead_hint_outputs_are_ignored_when_other_outputs_are_constrained() {
+    fn poseidon2_permutation_is_natively_lowered_and_tamper_fails() {
         let circuit = Circuit {
-            current_witness_index: 8,
-            opcodes: vec![
-                Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Poseidon2Permutation {
+            current_witness_index: 7,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::Poseidon2Permutation {
                     inputs: vec![
+                        FunctionInput::Witness(Witness(0)),
                         FunctionInput::Witness(Witness(1)),
                         FunctionInput::Witness(Witness(2)),
                         FunctionInput::Witness(Witness(3)),
-                        FunctionInput::Witness(Witness(4)),
                     ],
-                    outputs: vec![Witness(5), Witness(6), Witness(7), Witness(8)],
-                }),
-                Opcode::AssertZero(Expression {
-                    mul_terms: Vec::new(),
-                    linear_combinations: vec![
-                        (FieldElement::one(), Witness(5)),
-                        (-FieldElement::one(), Witness(1)),
-                    ],
-                    q_c: FieldElement::zero(),
-                }),
-            ],
-            private_parameters: BTreeSet::from([Witness(1), Witness(2), Witness(3), Witness(4)]),
+                    outputs: vec![Witness(4), Witness(5), Witness(6), Witness(7)],
+                },
+            )],
+            private_parameters: BTreeSet::from([Witness(0), Witness(1), Witness(2), Witness(3)]),
             ..Circuit::default()
         };
         let program = Program {
@@ -3266,23 +3926,164 @@ mod tests {
             unconstrained_functions: Vec::new(),
         };
 
-        let system = compile_r1cs(&program).expect("dead hint outputs should be allowed");
+        let system = compile_r1cs(&program).expect("Poseidon2 permutation should lower natively");
+        assert!(system.n_constraints > 0);
+
+        let inputs = [
+            FieldElement::from(3u128),
+            FieldElement::from(9u128),
+            FieldElement::from(27u128),
+            FieldElement::from(81u128),
+        ];
+        let outputs_vec =
+            poseidon2_permutation(&inputs).expect("poseidon2 permutation should solve");
+        let outputs: [FieldElement; 4] = outputs_vec
+            .try_into()
+            .expect("poseidon2 permutation must produce four outputs");
+
         let witness = vec![
             FieldElement::one(),
-            FieldElement::zero(),
-            FieldElement::from(5u128),
-            FieldElement::from(2u128),
-            FieldElement::from(3u128),
-            FieldElement::from(4u128),
-            FieldElement::from(5u128),
-            FieldElement::from(99u128),
-            FieldElement::from(55u128),
-            FieldElement::from(77u128),
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            outputs[0],
+            outputs[1],
+            outputs[2],
+            outputs[3],
         ];
         assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
 
         let mut tampered = witness.clone();
         tampered[6] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn embedded_curve_add_is_natively_lowered_and_tamper_fails() {
+        let circuit = Circuit {
+            current_witness_index: 9,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::EmbeddedCurveAdd {
+                    input1: Box::new([
+                        FunctionInput::Witness(Witness(0)),
+                        FunctionInput::Witness(Witness(1)),
+                        FunctionInput::Witness(Witness(2)),
+                    ]),
+                    input2: Box::new([
+                        FunctionInput::Witness(Witness(3)),
+                        FunctionInput::Witness(Witness(4)),
+                        FunctionInput::Witness(Witness(5)),
+                    ]),
+                    predicate: FunctionInput::Witness(Witness(9)),
+                    outputs: (Witness(6), Witness(7), Witness(8)),
+                },
+            )],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+                Witness(9),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+        let (output_x, output_y, output_infinite) = embedded_curve_add(
+            [generator_x, generator_y, FieldElement::zero()],
+            [generator_x, generator_y, FieldElement::zero()],
+        )
+        .expect("embedded curve add should succeed for doubled generator");
+
+        let system = compile_r1cs(&program).expect("embedded curve add should lower natively");
+        assert!(system.n_constraints > 0);
+        let witness = vec![
+            FieldElement::one(),
+            generator_x,
+            generator_y,
+            FieldElement::zero(),
+            generator_x,
+            generator_y,
+            FieldElement::zero(),
+            output_x,
+            output_y,
+            output_infinite,
+            FieldElement::one(),
+        ];
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[8] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn embedded_curve_add_predicate_false_allows_unconstrained_inputs_and_forces_infinity_output() {
+        let circuit = Circuit {
+            current_witness_index: 9,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::EmbeddedCurveAdd {
+                    input1: Box::new([
+                        FunctionInput::Witness(Witness(0)),
+                        FunctionInput::Witness(Witness(1)),
+                        FunctionInput::Witness(Witness(2)),
+                    ]),
+                    input2: Box::new([
+                        FunctionInput::Witness(Witness(3)),
+                        FunctionInput::Witness(Witness(4)),
+                        FunctionInput::Witness(Witness(5)),
+                    ]),
+                    predicate: FunctionInput::Witness(Witness(9)),
+                    outputs: (Witness(6), Witness(7), Witness(8)),
+                },
+            )],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+                Witness(9),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system = compile_r1cs(&program).expect("embedded curve add should lower natively");
+
+        let witness = vec![
+            FieldElement::one(),
+            FieldElement::from(123u128),
+            FieldElement::from(456u128),
+            FieldElement::from(5u128),
+            FieldElement::from(789u128),
+            FieldElement::from(999u128),
+            FieldElement::from(7u128),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+            FieldElement::zero(),
+        ];
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[9] = FieldElement::zero();
         assert!(!system.is_satisfied(&tampered));
     }
 

@@ -11,8 +11,10 @@ r1cs-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+hex = "0.4"
 
 [dev-dependencies]
 noir-witness = { path = "../noir-witness" }
+bn254_blackbox_solver.workspace = true
 tempfile.workspace = true
 proptest = "1.6"
