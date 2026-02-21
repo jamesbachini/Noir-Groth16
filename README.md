@@ -168,16 +168,15 @@ Target assumptions:
 | `AssertZero(Expression)` | Supported | Canonical lowering with deterministic row/wire ordering. |
 | `MemoryInit { .. }` | Supported | Deterministic memory block initialization. |
 | `MemoryOp { .. }` | Supported (with checks) | Static/dynamic memory access lowering; invalid block/index forms fail loudly. |
-| `BlackBoxFuncCall(BlackBoxFuncCall)` | Partially supported | Native lowering for `AND`, `XOR`, and `RANGE` (<= 252 bits). Other blackboxes are hint-lowered and require downstream constraints on outputs. |
+| `BlackBoxFuncCall(BlackBoxFuncCall)` | Partially supported | Native lowering for `AND`, `XOR`, and `RANGE` (exact for `num_bits <= 253`; tautological acceptance for `num_bits >= 254` on BN254). Other blackboxes are hint-lowered and require downstream constraints on outputs. |
 | `BrilligCall { .. }` | Supported (guarded) | Lowered via hint plumbing; predicates must be boolean and outputs must be transitively constrained by non-hint rows. |
 | `Call { .. }` | Supported (guarded) | Non-recursive nested calls supported with predicate gating and output binding constraints. |
 
 ### Unsupported / rejected cases
 
-- `RANGE` with `num_bits > 252`.
 - Predicates for `Call` / `BrilligCall` that are not 0/1.
 - Recursive `Call` and invalid call targets (including function id 0 / main).
-- Blackbox or Brillig opcodes that expose no outputs.
+- Blackbox or Brillig opcodes that expose no outputs when their predicate is not provably false.
 - Hint outputs not constrained by non-hint R1CS rows.
 
 ### Execution modes

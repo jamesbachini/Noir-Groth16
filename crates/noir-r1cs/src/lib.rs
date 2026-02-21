@@ -772,14 +772,6 @@ impl<'a> LoweringContext<'a> {
         predicate: &AcirExpression,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
-        if outputs.is_empty() {
-            return self.unsupported_opcode(
-                "BrilligCall",
-                opcode_index,
-                "BrilligCall must expose at least one output witness".to_string(),
-            );
-        }
-
         for input in inputs {
             match input {
                 BrilligInputs::Single(expr) => {
@@ -808,6 +800,18 @@ impl<'a> LoweringContext<'a> {
         }
 
         let pred_const = predicate.to_const().copied();
+        if outputs.is_empty() {
+            if pred_const.is_some_and(|value| value.is_zero()) {
+                return Ok(());
+            }
+            return self.unsupported_opcode(
+                "BrilligCall",
+                opcode_index,
+                "BrilligCall must expose at least one output witness unless predicate is constant 0"
+                    .to_string(),
+            );
+        }
+
         let pred_wire = match pred_const {
             Some(value) if value.is_zero() || value.is_one() => None,
             _ => Some(self.bind_expression_to_new_wire(
@@ -1396,12 +1400,15 @@ impl<'a> LoweringContext<'a> {
         num_bits: u32,
         opcode_index: usize,
     ) -> Result<(), R1csError> {
-        if num_bits > 252 {
-            return self.unsupported_opcode(
-                "BlackBoxFuncCall::RANGE",
-                opcode_index,
-                format!("RANGE supports up to 252 bits in this backend, got {num_bits}"),
-            );
+        let exact_range_bits = FieldElement::max_num_bits().saturating_sub(1);
+
+        if num_bits > exact_range_bits {
+            // Over a prime field, values are already canonical field elements.
+            // RANGE checks at/above field bit width are tautological in ACVM semantics.
+            if let FunctionInput::Witness(witness) = input {
+                self.ensure_witness_in_range(*witness, "BlackBoxFuncCall::RANGE input")?;
+            }
+            return Ok(());
         }
 
         let _ = self.decompose_function_input_to_bits(
@@ -1430,6 +1437,9 @@ impl<'a> LoweringContext<'a> {
 
         let outputs = call.get_outputs_vec();
         if outputs.is_empty() {
+            if self.blackbox_no_output_call_is_provably_disabled(call) {
+                return Ok(());
+            }
             return self.unsupported_opcode(
                 "BlackBoxFuncCall",
                 opcode_index,
@@ -1445,6 +1455,16 @@ impl<'a> LoweringContext<'a> {
         }
 
         Ok(())
+    }
+
+    fn blackbox_no_output_call_is_provably_disabled(&self, call: &AcirBlackBoxFuncCall) -> bool {
+        matches!(
+            call,
+            BlackBoxFuncCall::RecursiveAggregation {
+                predicate: FunctionInput::Constant(value),
+                ..
+            } if value.is_zero()
+        )
     }
 
     fn decompose_function_input_to_bits(
@@ -2944,6 +2964,56 @@ mod tests {
     }
 
     #[test]
+    fn brillig_without_outputs_with_false_predicate_is_noop() {
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BrilligCall {
+                id: BrilligFunctionId(0),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                predicate: Expression::zero(),
+            }],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system =
+            compile_r1cs(&program).expect("predicate-zero Brillig call without outputs is a no-op");
+        assert_eq!(system.n_constraints, 0);
+        assert!(system.is_satisfied(&[FieldElement::one()]));
+    }
+
+    #[test]
+    fn recursive_aggregation_without_outputs_is_allowed_when_const_false() {
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::RecursiveAggregation {
+                    verification_key: Vec::new(),
+                    proof: Vec::new(),
+                    public_inputs: Vec::new(),
+                    key_hash: FunctionInput::Constant(FieldElement::zero()),
+                    proof_type: 0,
+                    predicate: FunctionInput::Constant(FieldElement::zero()),
+                },
+            )],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program)
+            .expect("predicate-zero recursive aggregation without outputs is a no-op");
+        assert_eq!(system.n_constraints, 0);
+        assert!(system.is_satisfied(&[FieldElement::one()]));
+    }
+
+    #[test]
     fn brillig_inverse_hint_is_supported_when_outputs_are_constrained() {
         let circuit = Circuit {
             current_witness_index: 3,
@@ -3332,6 +3402,59 @@ mod tests {
 
         let system = compile_r1cs(&program).expect("8-bit range should compile");
         assert!(system.n_constraints > 0);
+    }
+
+    #[test]
+    fn range_253_bits_accepts_small_value_and_rejects_field_max() {
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
+                input: FunctionInput::Witness(Witness(0)),
+                num_bits: 253,
+            })],
+            private_parameters: BTreeSet::from([Witness(0)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("253-bit range should compile");
+        let ok_value = FieldElement::from(2u128).pow(&FieldElement::from(252u128));
+        let witness_ok = vec![FieldElement::one(), ok_value];
+        assert!(system.is_satisfied(&witness_ok));
+        assert_r1cs_satisfied(&system, &witness_ok);
+
+        let witness_bad = vec![FieldElement::one(), -FieldElement::one()];
+        assert!(!system.is_satisfied(&witness_bad));
+    }
+
+    #[test]
+    fn range_at_or_above_field_width_is_tautological() {
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![
+                Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
+                    input: FunctionInput::Witness(Witness(0)),
+                    num_bits: 254,
+                }),
+                Opcode::BlackBoxFuncCall(BlackBoxFuncCall::RANGE {
+                    input: FunctionInput::Witness(Witness(0)),
+                    num_bits: 512,
+                }),
+            ],
+            private_parameters: BTreeSet::from([Witness(0)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("range >= field width should compile");
+        assert_eq!(system.n_constraints, 0);
+        assert!(system.is_satisfied(&[FieldElement::one(), -FieldElement::one()]));
     }
 
     #[test]
