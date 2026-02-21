@@ -1,0 +1,12 @@
+title: Noir-Groth16 Documentation
+description: Technical reference for Noir artifact parsing, witness generation, and Groth16 interop outputs.
+remote_theme: just-the-docs/just-the-docs
+plugins:
+  - jekyll-remote-theme
+
+search_enabled: true
+heading_anchors: true
+back_to_top: true
+back_to_top_text: "Back to top"
+
+footer_content: "Noir-Groth16 documentation."
