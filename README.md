@@ -8,9 +8,12 @@ Pipeline:
 3. Lower supported ACIR constraints into R1CS.
 4. Emit deterministic artifacts (`.r1cs`, `.wtns`, JSON/bin debug outputs).
 
+
 ## Docs
 
+Full documentation available at:
 https://jamesbachini.github.io/Noir-Groth16/
+
 
 ## Workspace Layout
 
@@ -20,6 +23,7 @@ https://jamesbachini.github.io/Noir-Groth16/
 - `crates/noir-cli`: CLI entrypoints.
 - `examples/`: Noir example packages (including `examples/demo`).
 - `test-vectors/`: Fixture artifacts + inputs used by tests.
+
 
 ## Getting Started
 
@@ -55,6 +59,7 @@ You can also run without building manually:
 ```bash
 cargo run -p noir-cli -- <command> ...
 ```
+
 
 ## CLI Commands
 
@@ -109,9 +114,8 @@ Outputs:
 - `out/interop/circuit.r1cs`
 - `out/interop/witness.wtns`
 
-## Example Process (Groth16 End-to-End)
 
-This replaces the old `tutorial.md` flow.
+## Example Process (Groth16 End-to-End)
 
 ### 1) Build CLI
 
@@ -193,6 +197,7 @@ Target assumptions:
 - `--allow-unsupported`: collects unsupported opcode diagnostics and writes `unsupported_opcodes.json`, but still fails and does not emit final `.r1cs` / `.wtns`.
 - Witness solving mode defaults to pedantic predicate/selector validation. Use `--no-pedantic` on `witness`/`interop` only when intentionally matching legacy non-pedantic ACVM behavior.
 
+
 ## Development Workflow
 
 Run before PRs:
@@ -217,9 +222,11 @@ nargo --version
 cargo test -p noir-cli compatibility_corpus_differential_checks -- --ignored --nocapture
 ```
 
+
 ## Disclaimer
 
 Experimental software; not currently suitable for production use.
+
 
 ## License
 
