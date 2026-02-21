@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 acir.workspace = true
+acvm.workspace = true
+bn254_blackbox_solver.workspace = true
 noir-acir = { path = "../noir-acir" }
 r1cs-file.workspace = true
 serde.workspace = true
@@ -15,6 +17,5 @@ hex = "0.4"
 
 [dev-dependencies]
 noir-witness = { path = "../noir-witness" }
-bn254_blackbox_solver.workspace = true
 tempfile.workspace = true
 proptest = "1.6"

@@ -1290,6 +1290,7 @@ name = "noir-r1cs"
 version = "0.1.0"
 dependencies = [
  "acir 1.0.0-beta.19",
+ "acvm",
  "bn254_blackbox_solver",
  "hex",
  "noir-acir",

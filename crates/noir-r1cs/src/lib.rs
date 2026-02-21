@@ -13,6 +13,10 @@ use acir::{
     native_types::{Expression, Witness},
     AcirField, FieldElement,
 };
+use acvm::blackbox_solver::{
+    blake2s, blake3, ecdsa_secp256k1_verify, ecdsa_secp256r1_verify, sha256_compression,
+};
+use bn254_blackbox_solver::multi_scalar_mul as bn254_multi_scalar_mul;
 use r1cs_file::{
     Constraint, Constraints, FieldElement as R1csFieldElement, Header, R1csFile, WireMap,
 };
@@ -1281,8 +1285,26 @@ impl<'a> LoweringContext<'a> {
             BlackBoxFuncCall::RANGE { input, num_bits } => {
                 self.lower_range(input, *num_bits, opcode_index)
             }
+            call @ BlackBoxFuncCall::Blake2s { .. } => {
+                self.lower_blake2s_with_constant_folding(call, opcode_index)
+            }
+            call @ BlackBoxFuncCall::Blake3 { .. } => {
+                self.lower_blake3_with_constant_folding(call, opcode_index)
+            }
+            call @ BlackBoxFuncCall::EcdsaSecp256k1 { .. } => {
+                self.lower_ecdsa_with_constant_folding(call, opcode_index, true)
+            }
+            call @ BlackBoxFuncCall::EcdsaSecp256r1 { .. } => {
+                self.lower_ecdsa_with_constant_folding(call, opcode_index, false)
+            }
             BlackBoxFuncCall::Poseidon2Permutation { inputs, outputs } => {
                 self.lower_poseidon2_permutation(inputs, outputs, opcode_index)
+            }
+            call @ BlackBoxFuncCall::Sha256Compression { .. } => {
+                self.lower_sha256_compression_with_constant_folding(call, opcode_index)
+            }
+            call @ BlackBoxFuncCall::MultiScalarMul { .. } => {
+                self.lower_multi_scalar_mul_with_constant_folding(call, opcode_index)
             }
             BlackBoxFuncCall::EmbeddedCurveAdd {
                 input1,
@@ -1444,6 +1466,590 @@ impl<'a> LoweringContext<'a> {
             opcode_index,
             "BlackBoxFuncCall::RANGE input",
         )?;
+        Ok(())
+    }
+
+    fn lower_blake2s_with_constant_folding(
+        &mut self,
+        call: &AcirBlackBoxFuncCall,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let (inputs, outputs) = match call {
+            BlackBoxFuncCall::Blake2s { inputs, outputs } => (inputs.as_slice(), outputs.as_ref()),
+            _ => unreachable!("caller must pass Blake2s"),
+        };
+
+        for input in inputs {
+            self.lower_range(input, 8, opcode_index)?;
+        }
+
+        let mut bytes = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake2s constant input must fit into 8 bits, found {value}"),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake2s constant input must fit into 8 bits, found {value}"),
+                        );
+                    }
+                    bytes.push(word as u8);
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let digest = match blake2s(&bytes) {
+            Ok(digest) => digest,
+            Err(err) => {
+                return self.unsupported_opcode(
+                    "BlackBoxFuncCall",
+                    opcode_index,
+                    format!("failed evaluating constant Blake2s inputs: {err}"),
+                );
+            }
+        };
+
+        for (output, byte) in outputs.iter().zip(digest.into_iter()) {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake2s output")?;
+            let output_wire = self.wire_for_witness(*output)?;
+            self.enforce_wire_equals_constant(output_wire, FieldElement::from(u128::from(byte)))?;
+        }
+
+        Ok(())
+    }
+
+    fn lower_blake3_with_constant_folding(
+        &mut self,
+        call: &AcirBlackBoxFuncCall,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let (inputs, outputs) = match call {
+            BlackBoxFuncCall::Blake3 { inputs, outputs } => (inputs.as_slice(), outputs.as_ref()),
+            _ => unreachable!("caller must pass Blake3"),
+        };
+
+        for input in inputs {
+            self.lower_range(input, 8, opcode_index)?;
+        }
+
+        let mut bytes = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake3 constant input must fit into 8 bits, found {value}"),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake3 constant input must fit into 8 bits, found {value}"),
+                        );
+                    }
+                    bytes.push(word as u8);
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let digest = match blake3(&bytes) {
+            Ok(digest) => digest,
+            Err(err) => {
+                return self.unsupported_opcode(
+                    "BlackBoxFuncCall",
+                    opcode_index,
+                    format!("failed evaluating constant Blake3 inputs: {err}"),
+                );
+            }
+        };
+
+        for (output, byte) in outputs.iter().zip(digest.into_iter()) {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake3 output")?;
+            let output_wire = self.wire_for_witness(*output)?;
+            self.enforce_wire_equals_constant(output_wire, FieldElement::from(u128::from(byte)))?;
+        }
+
+        Ok(())
+    }
+
+    fn lower_sha256_compression_with_constant_folding(
+        &mut self,
+        call: &AcirBlackBoxFuncCall,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let (inputs, hash_values, outputs) = match call {
+            BlackBoxFuncCall::Sha256Compression {
+                inputs,
+                hash_values,
+                outputs,
+            } => (inputs.as_ref(), hash_values.as_ref(), outputs.as_ref()),
+            _ => unreachable!("caller must pass Sha256Compression"),
+        };
+
+        for input in inputs {
+            self.lower_range(input, 32, opcode_index)?;
+        }
+        for hash_value in hash_values {
+            self.lower_range(hash_value, 32, opcode_index)?;
+        }
+
+        let mut message = [0u32; 16];
+        for (index, input) in inputs.iter().enumerate() {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "Sha256Compression constant input word must fit into 32 bits, found {value}"
+                            ),
+                        );
+                    };
+                    message[index] = word;
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let mut state = [0u32; 8];
+        for (index, hash_value) in hash_values.iter().enumerate() {
+            match hash_value {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "Sha256Compression constant hash value must fit into 32 bits, found {value}"
+                            ),
+                        );
+                    };
+                    state[index] = word;
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        sha256_compression(&mut state, &message);
+        for (output, value) in outputs.iter().zip(state.into_iter()) {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Sha256Compression output")?;
+            let output_wire = self.wire_for_witness(*output)?;
+            self.enforce_wire_equals_constant(output_wire, FieldElement::from(u128::from(value)))?;
+        }
+
+        Ok(())
+    }
+
+    fn lower_ecdsa_with_constant_folding(
+        &mut self,
+        call: &AcirBlackBoxFuncCall,
+        opcode_index: usize,
+        secp256k1: bool,
+    ) -> Result<(), R1csError> {
+        let (public_key_x, public_key_y, signature, hashed_message, predicate, output) =
+            if secp256k1 {
+                match call {
+                    BlackBoxFuncCall::EcdsaSecp256k1 {
+                        public_key_x,
+                        public_key_y,
+                        signature,
+                        hashed_message,
+                        predicate,
+                        output,
+                    } => (
+                        public_key_x.as_ref(),
+                        public_key_y.as_ref(),
+                        signature.as_ref(),
+                        hashed_message.as_ref(),
+                        predicate,
+                        *output,
+                    ),
+                    _ => unreachable!("caller must pass EcdsaSecp256k1"),
+                }
+            } else {
+                match call {
+                    BlackBoxFuncCall::EcdsaSecp256r1 {
+                        public_key_x,
+                        public_key_y,
+                        signature,
+                        hashed_message,
+                        predicate,
+                        output,
+                    } => (
+                        public_key_x.as_ref(),
+                        public_key_y.as_ref(),
+                        signature.as_ref(),
+                        hashed_message.as_ref(),
+                        predicate,
+                        *output,
+                    ),
+                    _ => unreachable!("caller must pass EcdsaSecp256r1"),
+                }
+            };
+
+        for input in public_key_x
+            .iter()
+            .chain(public_key_y.iter())
+            .chain(signature.iter())
+            .chain(hashed_message.iter())
+        {
+            self.lower_range(input, 8, opcode_index)?;
+        }
+
+        self.ensure_witness_in_range(output, "BlackBoxFuncCall::Ecdsa output")?;
+        let output_wire = self.wire_for_witness(output)?;
+
+        match predicate {
+            FunctionInput::Constant(value) if value.is_zero() => {
+                // ACVM writes `true` for disabled ECDSA calls.
+                self.enforce_wire_equals_constant(output_wire, FieldElement::one())?;
+                return Ok(());
+            }
+            FunctionInput::Constant(value) if value.is_one() => {}
+            FunctionInput::Constant(value) => {
+                return self.unsupported_opcode(
+                    "BlackBoxFuncCall",
+                    opcode_index,
+                    format!("ECDSA predicate must be 0 or 1, found {value}"),
+                );
+            }
+            FunctionInput::Witness(_) => return self.lower_blackbox_as_hint(call, opcode_index),
+        }
+
+        let mut pub_key_x = [0u8; 32];
+        for (index, input) in public_key_x.iter().enumerate() {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key x constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key x constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    pub_key_x[index] = word as u8;
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let mut pub_key_y = [0u8; 32];
+        for (index, input) in public_key_y.iter().enumerate() {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key y constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key y constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    pub_key_y[index] = word as u8;
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let mut signature_bytes = [0u8; 64];
+        for (index, input) in signature.iter().enumerate() {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA signature constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA signature constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    signature_bytes[index] = word as u8;
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let mut hashed_message_bytes = [0u8; 32];
+        for (index, input) in hashed_message.iter().enumerate() {
+            match input {
+                FunctionInput::Constant(value) => {
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA hashed message constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA hashed message constant input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    hashed_message_bytes[index] = word as u8;
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let is_valid = if secp256k1 {
+            match ecdsa_secp256k1_verify(
+                &hashed_message_bytes,
+                &pub_key_x,
+                &pub_key_y,
+                &signature_bytes,
+            ) {
+                Ok(is_valid) => is_valid,
+                Err(err) => {
+                    return self.unsupported_opcode(
+                        "BlackBoxFuncCall",
+                        opcode_index,
+                        format!("failed evaluating constant EcdsaSecp256k1 inputs: {err}"),
+                    );
+                }
+            }
+        } else {
+            match ecdsa_secp256r1_verify(
+                &hashed_message_bytes,
+                &pub_key_x,
+                &pub_key_y,
+                &signature_bytes,
+            ) {
+                Ok(is_valid) => is_valid,
+                Err(err) => {
+                    return self.unsupported_opcode(
+                        "BlackBoxFuncCall",
+                        opcode_index,
+                        format!("failed evaluating constant EcdsaSecp256r1 inputs: {err}"),
+                    );
+                }
+            }
+        };
+        let output_value = if is_valid {
+            FieldElement::one()
+        } else {
+            FieldElement::zero()
+        };
+        self.enforce_wire_equals_constant(output_wire, output_value)?;
+
+        Ok(())
+    }
+
+    fn lower_multi_scalar_mul_with_constant_folding(
+        &mut self,
+        call: &AcirBlackBoxFuncCall,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let (points, scalars, predicate, outputs) = match call {
+            BlackBoxFuncCall::MultiScalarMul {
+                points,
+                scalars,
+                predicate,
+                outputs,
+            } => (points.as_slice(), scalars.as_slice(), predicate, *outputs),
+            _ => unreachable!("caller must pass MultiScalarMul"),
+        };
+
+        if !points.len().is_multiple_of(3) {
+            return self.unsupported_opcode(
+                "BlackBoxFuncCall",
+                opcode_index,
+                format!(
+                    "MultiScalarMul expects points length to be a multiple of 3, found {}",
+                    points.len()
+                ),
+            );
+        }
+        if !scalars.len().is_multiple_of(2) {
+            return self.unsupported_opcode(
+                "BlackBoxFuncCall",
+                opcode_index,
+                format!(
+                    "MultiScalarMul expects scalars length to be a multiple of 2, found {}",
+                    scalars.len()
+                ),
+            );
+        }
+        if points.len() / 3 != scalars.len() / 2 {
+            return self.unsupported_opcode(
+                "BlackBoxFuncCall",
+                opcode_index,
+                format!(
+                    "MultiScalarMul points/scalars arity mismatch: {} points vs {} scalars",
+                    points.len(),
+                    scalars.len()
+                ),
+            );
+        }
+
+        let output_witnesses = [outputs.0, outputs.1, outputs.2];
+        let mut output_wires = [0u32; 3];
+        for (index, output) in output_witnesses.iter().enumerate() {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::MultiScalarMul output")?;
+            output_wires[index] = self.wire_for_witness(*output)?;
+        }
+        let output_x_wire = output_wires[0];
+        let output_y_wire = output_wires[1];
+        let output_infinite_wire = output_wires[2];
+        self.enforce_boolean_wire(output_infinite_wire)?;
+
+        let predicate = self.resolve_blackbox_predicate(
+            predicate,
+            opcode_index,
+            "BlackBoxFuncCall::MultiScalarMul predicate",
+        )?;
+        if matches!(predicate, ResolvedBlackBoxPredicate::Constant(false)) {
+            self.enforce_wire_equals_constant(output_x_wire, FieldElement::zero())?;
+            self.enforce_wire_equals_constant(output_y_wire, FieldElement::zero())?;
+            self.enforce_wire_equals_constant(output_infinite_wire, FieldElement::one())?;
+            return Ok(());
+        }
+
+        let predicate_wire = match predicate {
+            ResolvedBlackBoxPredicate::Constant(true) => 0,
+            ResolvedBlackBoxPredicate::Wire(wire) => wire,
+            ResolvedBlackBoxPredicate::Constant(false) => unreachable!(),
+        };
+        if let ResolvedBlackBoxPredicate::Wire(wire) = predicate {
+            let one_minus_predicate = self.boolean_not_wire(wire)?;
+            self.enforce_selector_times_linear_zero(
+                one_minus_predicate,
+                &[(output_x_wire, FieldElement::one())],
+                FieldElement::zero(),
+            )?;
+            self.enforce_selector_times_linear_zero(
+                one_minus_predicate,
+                &[(output_y_wire, FieldElement::one())],
+                FieldElement::zero(),
+            )?;
+            self.enforce_selector_times_linear_zero(
+                one_minus_predicate,
+                &[(output_infinite_wire, FieldElement::one())],
+                -FieldElement::one(),
+            )?;
+        }
+
+        let mut point_values = Vec::with_capacity(points.len());
+        for point in points {
+            match point {
+                FunctionInput::Constant(value) => point_values.push(*value),
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let mut scalar_lo = Vec::with_capacity(scalars.len() / 2);
+        let mut scalar_hi = Vec::with_capacity(scalars.len() / 2);
+        for (index, scalar) in scalars.iter().enumerate() {
+            match scalar {
+                FunctionInput::Constant(value) => {
+                    if index.is_multiple_of(2) {
+                        scalar_lo.push(*value);
+                    } else {
+                        scalar_hi.push(*value);
+                    }
+                }
+                FunctionInput::Witness(_) => {
+                    return self.lower_blackbox_as_hint(call, opcode_index)
+                }
+            }
+        }
+
+        let (result_x, result_y, result_infinite) =
+            match bn254_multi_scalar_mul(&point_values, &scalar_lo, &scalar_hi) {
+                Ok(result) => result,
+                Err(err) => {
+                    return self.unsupported_opcode(
+                        "BlackBoxFuncCall",
+                        opcode_index,
+                        format!("failed evaluating constant MultiScalarMul inputs: {err}"),
+                    );
+                }
+            };
+
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[(output_x_wire, FieldElement::one())],
+            -result_x,
+        )?;
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[(output_y_wire, FieldElement::one())],
+            -result_y,
+        )?;
+        self.enforce_selector_times_linear_zero(
+            predicate_wire,
+            &[(output_infinite_wire, FieldElement::one())],
+            -result_infinite,
+        )?;
+
         Ok(())
     }
 
@@ -3599,7 +4205,8 @@ mod tests {
         native_types::{Expression, Witness},
         FieldElement,
     };
-    use bn254_blackbox_solver::embedded_curve_add;
+    use acvm::blackbox_solver::{blake2s, blake3, sha256_compression};
+    use bn254_blackbox_solver::{embedded_curve_add, multi_scalar_mul as bn254_multi_scalar_mul};
     use noir_acir::Artifact;
     use noir_witness::{generate_witness_from_json_str, poseidon2_permutation};
     use proptest::prelude::*;
@@ -4088,6 +4695,168 @@ mod tests {
     }
 
     #[test]
+    fn multi_scalar_mul_constant_inputs_are_natively_lowered_and_tamper_fails() {
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+
+        let circuit = Circuit {
+            current_witness_index: 2,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::MultiScalarMul {
+                points: vec![
+                    FunctionInput::Constant(generator_x),
+                    FunctionInput::Constant(generator_y),
+                    FunctionInput::Constant(FieldElement::zero()),
+                ],
+                scalars: vec![
+                    FunctionInput::Constant(FieldElement::one()),
+                    FunctionInput::Constant(FieldElement::zero()),
+                ],
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                outputs: (Witness(0), Witness(1), Witness(2)),
+            })],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let (output_x, output_y, output_infinite) = bn254_multi_scalar_mul(
+            &[generator_x, generator_y, FieldElement::zero()],
+            &[FieldElement::one()],
+            &[FieldElement::zero()],
+        )
+        .expect("constant multi-scalar multiplication should succeed");
+
+        let system = compile_r1cs(&program).expect("multi-scalar multiplication should lower");
+        let witness = vec![FieldElement::one(), output_x, output_y, output_infinite];
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[2] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn multi_scalar_mul_predicate_false_forces_infinity_output() {
+        let circuit = Circuit {
+            current_witness_index: 8,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::MultiScalarMul {
+                points: vec![
+                    FunctionInput::Witness(Witness(0)),
+                    FunctionInput::Witness(Witness(1)),
+                    FunctionInput::Witness(Witness(2)),
+                ],
+                scalars: vec![
+                    FunctionInput::Witness(Witness(3)),
+                    FunctionInput::Witness(Witness(4)),
+                ],
+                predicate: FunctionInput::Witness(Witness(8)),
+                outputs: (Witness(5), Witness(6), Witness(7)),
+            })],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(8),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("multi-scalar multiplication should lower");
+        let witness = vec![
+            FieldElement::one(),
+            FieldElement::from(11u128),
+            FieldElement::from(22u128),
+            FieldElement::from(33u128),
+            FieldElement::from(44u128),
+            FieldElement::from(55u128),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+            FieldElement::zero(),
+        ];
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[8] = FieldElement::zero();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn multi_scalar_mul_dynamic_predicate_uses_native_constant_path() {
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+
+        let circuit = Circuit {
+            current_witness_index: 3,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::MultiScalarMul {
+                points: vec![
+                    FunctionInput::Constant(generator_x),
+                    FunctionInput::Constant(generator_y),
+                    FunctionInput::Constant(FieldElement::zero()),
+                ],
+                scalars: vec![
+                    FunctionInput::Constant(FieldElement::one()),
+                    FunctionInput::Constant(FieldElement::zero()),
+                ],
+                predicate: FunctionInput::Witness(Witness(3)),
+                outputs: (Witness(0), Witness(1), Witness(2)),
+            })],
+            private_parameters: BTreeSet::from([Witness(3)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let (output_x, output_y, output_infinite) = bn254_multi_scalar_mul(
+            &[generator_x, generator_y, FieldElement::zero()],
+            &[FieldElement::one()],
+            &[FieldElement::zero()],
+        )
+        .expect("constant multi-scalar multiplication should succeed");
+
+        let system = compile_r1cs(&program).expect("multi-scalar multiplication should lower");
+        let witness_predicate_true = vec![
+            FieldElement::one(),
+            output_x,
+            output_y,
+            output_infinite,
+            FieldElement::one(),
+        ];
+        assert!(system.is_satisfied(&witness_predicate_true));
+        assert_r1cs_satisfied(&system, &witness_predicate_true);
+
+        let witness_predicate_false = vec![
+            FieldElement::one(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+            FieldElement::zero(),
+        ];
+        assert!(system.is_satisfied(&witness_predicate_false));
+        assert_r1cs_satisfied(&system, &witness_predicate_false);
+
+        let mut tampered = witness_predicate_true.clone();
+        tampered[2] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
     fn allow_unsupported_collects_coverage_without_emitting_r1cs() {
         let circuit = Circuit {
             current_witness_index: 1,
@@ -4293,6 +5062,222 @@ mod tests {
         ];
         assert_eq!(witness.len(), 6);
         assert!(system.n_constraints > 0);
+    }
+
+    #[test]
+    fn blake2s_constant_inputs_are_natively_lowered_and_tamper_fails() {
+        let outputs: [Witness; 32] = std::array::from_fn(|index| Witness(index as u32));
+        let circuit = Circuit {
+            current_witness_index: 31,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Blake2s {
+                inputs: vec![
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'a'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'b'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'c'))),
+                ],
+                outputs: Box::new(outputs),
+            })],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system = compile_r1cs(&program).expect("Blake2s constants should lower natively");
+
+        let digest = blake2s(b"abc").expect("blake2s should evaluate");
+        let mut witness = vec![FieldElement::one()];
+        witness.extend(
+            digest
+                .into_iter()
+                .map(|byte| FieldElement::from(u128::from(byte))),
+        );
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[10] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn blake3_constant_inputs_are_natively_lowered_and_tamper_fails() {
+        let outputs: [Witness; 32] = std::array::from_fn(|index| Witness(index as u32));
+        let circuit = Circuit {
+            current_witness_index: 31,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Blake3 {
+                inputs: vec![
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'a'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'b'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'c'))),
+                ],
+                outputs: Box::new(outputs),
+            })],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system = compile_r1cs(&program).expect("Blake3 constants should lower natively");
+
+        let digest = blake3(b"abc").expect("blake3 should evaluate");
+        let mut witness = vec![FieldElement::one()];
+        witness.extend(
+            digest
+                .into_iter()
+                .map(|byte| FieldElement::from(u128::from(byte))),
+        );
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[10] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn sha256_compression_constant_inputs_are_natively_lowered_and_tamper_fails() {
+        let outputs: [Witness; 8] = std::array::from_fn(|index| Witness(index as u32));
+        let message_words = [0u32; 16];
+        let hash_words = [0u32; 8];
+        let circuit =
+            Circuit {
+                current_witness_index: 7,
+                opcodes: vec![Opcode::BlackBoxFuncCall(
+                    BlackBoxFuncCall::Sha256Compression {
+                        inputs: Box::new(message_words.map(|word| {
+                            FunctionInput::Constant(FieldElement::from(u128::from(word)))
+                        })),
+                        hash_values: Box::new(hash_words.map(|word| {
+                            FunctionInput::Constant(FieldElement::from(u128::from(word)))
+                        })),
+                        outputs: Box::new(outputs),
+                    },
+                )],
+                ..Circuit::default()
+            };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system =
+            compile_r1cs(&program).expect("Sha256Compression constants should lower natively");
+
+        let mut expected_state = hash_words;
+        sha256_compression(&mut expected_state, &message_words);
+        let mut witness = vec![FieldElement::one()];
+        witness.extend(
+            expected_state
+                .into_iter()
+                .map(|word| FieldElement::from(u128::from(word))),
+        );
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[4] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn ecdsa_secp256k1_constant_inputs_are_natively_lowered_and_tamper_fails() {
+        let hashed_message: [u8; 32] = [
+            0x3a, 0x73, 0xf4, 0x12, 0x3a, 0x5c, 0xd2, 0x12, 0x1f, 0x21, 0xcd, 0x7e, 0x8d, 0x35,
+            0x88, 0x35, 0x47, 0x69, 0x49, 0xd0, 0x35, 0xd9, 0xc2, 0xda, 0x68, 0x06, 0xb4, 0x63,
+            0x3a, 0xc8, 0xc1, 0xe2,
+        ];
+        let pub_key_x: [u8; 32] = [
+            0xa0, 0x43, 0x4d, 0x9e, 0x47, 0xf3, 0xc8, 0x62, 0x35, 0x47, 0x7c, 0x7b, 0x1a, 0xe6,
+            0xae, 0x5d, 0x34, 0x42, 0xd4, 0x9b, 0x19, 0x43, 0xc2, 0xb7, 0x52, 0xa6, 0x8e, 0x2a,
+            0x47, 0xe2, 0x47, 0xc7,
+        ];
+        let pub_key_y: [u8; 32] = [
+            0x89, 0x3a, 0xba, 0x42, 0x54, 0x19, 0xbc, 0x27, 0xa3, 0xb6, 0xc7, 0xe6, 0x93, 0xa2,
+            0x4c, 0x69, 0x6f, 0x79, 0x4c, 0x2e, 0xd8, 0x77, 0xa1, 0x59, 0x3c, 0xbe, 0xe5, 0x3b,
+            0x03, 0x73, 0x68, 0xd7,
+        ];
+        let signature: [u8; 64] = [
+            0xe5, 0x08, 0x1c, 0x80, 0xab, 0x42, 0x7d, 0xc3, 0x70, 0x34, 0x6f, 0x4a, 0x0e, 0x31,
+            0xaa, 0x2b, 0xad, 0x8d, 0x97, 0x98, 0xc3, 0x80, 0x61, 0xdb, 0x9a, 0xe5, 0x5a, 0x4e,
+            0x8d, 0xf4, 0x54, 0xfd, 0x28, 0x11, 0x98, 0x94, 0x34, 0x4e, 0x71, 0xb7, 0x87, 0x70,
+            0xcc, 0x93, 0x1d, 0x61, 0xf4, 0x80, 0xec, 0xbb, 0x0b, 0x89, 0xd6, 0xeb, 0x69, 0x69,
+            0x01, 0x61, 0xe4, 0x9a, 0x71, 0x5f, 0xcd, 0x55,
+        ];
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::EcdsaSecp256k1 {
+                public_key_x: Box::new(
+                    pub_key_x
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                public_key_y: Box::new(
+                    pub_key_y
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                signature: Box::new(
+                    signature
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                hashed_message: Box::new(
+                    hashed_message
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                output: Witness(0),
+            })],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system =
+            compile_r1cs(&program).expect("constant secp256k1 ECDSA should lower natively");
+        let witness_ok = vec![FieldElement::one(), FieldElement::one()];
+        assert!(system.is_satisfied(&witness_ok));
+        assert_r1cs_satisfied(&system, &witness_ok);
+
+        let witness_bad = vec![FieldElement::one(), FieldElement::zero()];
+        assert!(!system.is_satisfied(&witness_bad));
+    }
+
+    #[test]
+    fn ecdsa_predicate_false_forces_true_output() {
+        let public_key_x: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(index as u32)));
+        let public_key_y: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(32 + index as u32)));
+        let signature: [FunctionInput<FieldElement>; 64] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(64 + index as u32)));
+        let hashed_message: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(128 + index as u32)));
+        let circuit = Circuit {
+            current_witness_index: 160,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::EcdsaSecp256k1 {
+                public_key_x: Box::new(public_key_x),
+                public_key_y: Box::new(public_key_y),
+                signature: Box::new(signature),
+                hashed_message: Box::new(hashed_message),
+                predicate: FunctionInput::Constant(FieldElement::zero()),
+                output: Witness(160),
+            })],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system =
+            compile_r1cs(&program).expect("predicate-false secp256k1 ECDSA should lower natively");
+
+        let witness_ok = vec![FieldElement::one(); 162];
+        assert!(system.is_satisfied(&witness_ok));
+        assert_r1cs_satisfied(&system, &witness_ok);
+
+        let mut witness_bad = witness_ok.clone();
+        witness_bad[161] = FieldElement::zero();
+        assert!(!system.is_satisfied(&witness_bad));
     }
 
     #[test]
