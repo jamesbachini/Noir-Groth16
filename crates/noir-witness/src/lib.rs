@@ -5,6 +5,10 @@ use std::{
 };
 
 use acir::{
+    circuit::{
+        opcodes::{BlackBoxFuncCall, FunctionInput},
+        Opcode,
+    },
     native_types::{Witness, WitnessMap},
     AcirField, FieldElement,
 };
@@ -46,8 +50,49 @@ pub enum WitnessError {
     SolverFailed(String),
     #[error("unsupported ACVM status while solving: {0}")]
     UnsupportedAcvmStatus(String),
+    #[error(transparent)]
+    PedanticViolation(Box<PedanticViolationInfo>),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "pedantic solving rejected opcode `{opcode}` at index {index} in function {function_id} ({predicate_state}): {details}; exact_opcode={exact_opcode}; workaround={workaround}"
+)]
+pub struct PedanticViolationInfo {
+    pub opcode: String,
+    pub index: usize,
+    pub function_id: usize,
+    pub predicate_state: String,
+    pub exact_opcode: String,
+    pub details: String,
+    pub workaround: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WitnessSolveOptions {
+    pub pedantic_solving: bool,
+}
+
+impl WitnessSolveOptions {
+    pub const fn pedantic() -> Self {
+        Self {
+            pedantic_solving: true,
+        }
+    }
+
+    pub const fn relaxed() -> Self {
+        Self {
+            pedantic_solving: false,
+        }
+    }
+}
+
+impl Default for WitnessSolveOptions {
+    fn default() -> Self {
+        Self::pedantic()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -117,13 +162,33 @@ pub fn generate_witness_from_json_str(
     artifact: &Artifact,
     inputs_json: &str,
 ) -> Result<WitnessArtifacts, WitnessError> {
+    generate_witness_from_json_str_with_options(
+        artifact,
+        inputs_json,
+        WitnessSolveOptions::default(),
+    )
+}
+
+pub fn generate_witness_from_json_str_with_options(
+    artifact: &Artifact,
+    inputs_json: &str,
+    options: WitnessSolveOptions,
+) -> Result<WitnessArtifacts, WitnessError> {
     let inputs: Value = serde_json::from_str(inputs_json)?;
-    generate_witness(artifact, &inputs)
+    generate_witness_with_options(artifact, &inputs, options)
 }
 
 pub fn generate_witness(
     artifact: &Artifact,
     inputs: &Value,
+) -> Result<WitnessArtifacts, WitnessError> {
+    generate_witness_with_options(artifact, inputs, WitnessSolveOptions::default())
+}
+
+pub fn generate_witness_with_options(
+    artifact: &Artifact,
+    inputs: &Value,
+    options: WitnessSolveOptions,
 ) -> Result<WitnessArtifacts, WitnessError> {
     let input_obj = inputs.as_object().ok_or(WitnessError::InputsMustBeObject)?;
     let layout = artifact.witness_layout()?;
@@ -163,6 +228,10 @@ pub fn generate_witness(
         }
     }
 
+    if options.pedantic_solving {
+        validate_pedantic_constant_checks(artifact)?;
+    }
+
     let solver = Bn254BlackBoxSolver;
     let circuit = artifact.main_circuit();
     let mut acvm = ACVM::new(
@@ -184,12 +253,255 @@ pub fn generate_witness(
     }
 
     let witness_map = acvm.finalize();
+    if options.pedantic_solving {
+        validate_pedantic_dynamic_checks(circuit, &witness_map)?;
+    }
     let witness_vector = witness_map_to_vector(&witness_map, circuit.current_witness_index);
 
     Ok(WitnessArtifacts {
         witness_map,
         witness_vector,
     })
+}
+
+fn validate_pedantic_constant_checks(artifact: &Artifact) -> Result<(), WitnessError> {
+    for (function_id, circuit) in artifact.program.functions.iter().enumerate() {
+        for (index, opcode) in circuit.opcodes.iter().enumerate() {
+            let maybe_value = match opcode {
+                Opcode::Call { predicate, .. } | Opcode::BrilligCall { predicate, .. } => {
+                    predicate.to_const().copied()
+                }
+                Opcode::MemoryOp { op, .. } => op.operation.to_const().copied(),
+                Opcode::BlackBoxFuncCall(call) => constant_blackbox_predicate(call),
+                Opcode::AssertZero(_) | Opcode::MemoryInit { .. } => None,
+            };
+
+            if let Some(value) = maybe_value {
+                ensure_boolean_pedantic_value(
+                    opcode,
+                    function_id,
+                    index,
+                    value,
+                    "constant-check",
+                    "predicate/operation must be 0 or 1",
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_pedantic_dynamic_checks(
+    circuit: &acir::circuit::Circuit<FieldElement>,
+    witness_map: &WitnessMap<FieldElement>,
+) -> Result<(), WitnessError> {
+    for (index, opcode) in circuit.opcodes.iter().enumerate() {
+        match opcode {
+            Opcode::Call { predicate, .. } | Opcode::BrilligCall { predicate, .. } => {
+                let value = evaluate_expression(predicate, witness_map).map_err(|details| {
+                    pedantic_violation(opcode, 0, index, "dynamic-check".to_string(), details)
+                })?;
+                ensure_boolean_pedantic_value(
+                    opcode,
+                    0,
+                    index,
+                    value,
+                    "dynamic-check",
+                    "predicate must evaluate to 0 or 1",
+                )?;
+            }
+            Opcode::MemoryOp { op, .. } => {
+                let value = evaluate_expression(&op.operation, witness_map).map_err(|details| {
+                    pedantic_violation(opcode, 0, index, "dynamic-check".to_string(), details)
+                })?;
+                ensure_boolean_pedantic_value(
+                    opcode,
+                    0,
+                    index,
+                    value,
+                    "dynamic-check",
+                    "memory operation must evaluate to 0 or 1",
+                )?;
+            }
+            Opcode::BlackBoxFuncCall(call) => {
+                let value = evaluate_blackbox_predicate(call, witness_map).map_err(|details| {
+                    pedantic_violation(opcode, 0, index, "dynamic-check".to_string(), details)
+                })?;
+                ensure_boolean_pedantic_value(
+                    opcode,
+                    0,
+                    index,
+                    value,
+                    "dynamic-check",
+                    "blackbox predicate must evaluate to 0 or 1",
+                )?;
+            }
+            Opcode::AssertZero(_) | Opcode::MemoryInit { .. } => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_boolean_pedantic_value(
+    opcode: &Opcode<FieldElement>,
+    function_id: usize,
+    index: usize,
+    value: FieldElement,
+    predicate_state_prefix: &str,
+    details: &str,
+) -> Result<(), WitnessError> {
+    if value.is_zero() || value.is_one() {
+        return Ok(());
+    }
+
+    Err(pedantic_violation(
+        opcode,
+        function_id,
+        index,
+        format!("{predicate_state_prefix}=constant({value})"),
+        details.to_string(),
+    ))
+}
+
+fn constant_blackbox_predicate(call: &BlackBoxFuncCall<FieldElement>) -> Option<FieldElement> {
+    match call {
+        BlackBoxFuncCall::AES128Encrypt { .. }
+        | BlackBoxFuncCall::AND { .. }
+        | BlackBoxFuncCall::XOR { .. }
+        | BlackBoxFuncCall::RANGE { .. }
+        | BlackBoxFuncCall::Blake2s { .. }
+        | BlackBoxFuncCall::Blake3 { .. }
+        | BlackBoxFuncCall::Keccakf1600 { .. }
+        | BlackBoxFuncCall::Poseidon2Permutation { .. }
+        | BlackBoxFuncCall::Sha256Compression { .. } => Some(FieldElement::one()),
+        BlackBoxFuncCall::EcdsaSecp256k1 { predicate, .. }
+        | BlackBoxFuncCall::EcdsaSecp256r1 { predicate, .. }
+        | BlackBoxFuncCall::MultiScalarMul { predicate, .. }
+        | BlackBoxFuncCall::EmbeddedCurveAdd { predicate, .. }
+        | BlackBoxFuncCall::RecursiveAggregation { predicate, .. } => {
+            constant_function_input(predicate)
+        }
+    }
+}
+
+fn constant_function_input(input: &FunctionInput<FieldElement>) -> Option<FieldElement> {
+    match input {
+        FunctionInput::Constant(value) => Some(*value),
+        FunctionInput::Witness(_) => None,
+    }
+}
+
+fn evaluate_blackbox_predicate(
+    call: &BlackBoxFuncCall<FieldElement>,
+    witness_map: &WitnessMap<FieldElement>,
+) -> Result<FieldElement, String> {
+    match call {
+        BlackBoxFuncCall::AES128Encrypt { .. }
+        | BlackBoxFuncCall::AND { .. }
+        | BlackBoxFuncCall::XOR { .. }
+        | BlackBoxFuncCall::RANGE { .. }
+        | BlackBoxFuncCall::Blake2s { .. }
+        | BlackBoxFuncCall::Blake3 { .. }
+        | BlackBoxFuncCall::Keccakf1600 { .. }
+        | BlackBoxFuncCall::Poseidon2Permutation { .. }
+        | BlackBoxFuncCall::Sha256Compression { .. } => Ok(FieldElement::one()),
+        BlackBoxFuncCall::EcdsaSecp256k1 { predicate, .. }
+        | BlackBoxFuncCall::EcdsaSecp256r1 { predicate, .. }
+        | BlackBoxFuncCall::MultiScalarMul { predicate, .. }
+        | BlackBoxFuncCall::EmbeddedCurveAdd { predicate, .. }
+        | BlackBoxFuncCall::RecursiveAggregation { predicate, .. } => {
+            evaluate_function_input(predicate, witness_map)
+        }
+    }
+}
+
+fn evaluate_function_input(
+    input: &FunctionInput<FieldElement>,
+    witness_map: &WitnessMap<FieldElement>,
+) -> Result<FieldElement, String> {
+    match input {
+        FunctionInput::Constant(value) => Ok(*value),
+        FunctionInput::Witness(witness) => witness_value(witness_map, *witness)
+            .ok_or_else(|| format!("missing witness assignment for {}", witness.witness_index())),
+    }
+}
+
+fn evaluate_expression(
+    expr: &acir::native_types::Expression<FieldElement>,
+    witness_map: &WitnessMap<FieldElement>,
+) -> Result<FieldElement, String> {
+    let mut acc = expr.q_c;
+
+    for (coeff, lhs, rhs) in &expr.mul_terms {
+        let lhs_value = witness_value(witness_map, *lhs)
+            .ok_or_else(|| format!("missing witness assignment for {}", lhs.witness_index()))?;
+        let rhs_value = witness_value(witness_map, *rhs)
+            .ok_or_else(|| format!("missing witness assignment for {}", rhs.witness_index()))?;
+        acc += *coeff * lhs_value * rhs_value;
+    }
+
+    for (coeff, witness) in &expr.linear_combinations {
+        let value = witness_value(witness_map, *witness)
+            .ok_or_else(|| format!("missing witness assignment for {}", witness.witness_index()))?;
+        acc += *coeff * value;
+    }
+
+    Ok(acc)
+}
+
+fn witness_value(witness_map: &WitnessMap<FieldElement>, witness: Witness) -> Option<FieldElement> {
+    witness_map.get_index(witness.witness_index()).copied()
+}
+
+fn pedantic_violation(
+    opcode: &Opcode<FieldElement>,
+    function_id: usize,
+    index: usize,
+    predicate_state: String,
+    details: String,
+) -> WitnessError {
+    WitnessError::PedanticViolation(Box::new(PedanticViolationInfo {
+        opcode: witness_opcode_variant(opcode).to_string(),
+        index,
+        function_id,
+        predicate_state,
+        exact_opcode: opcode.to_string(),
+        details,
+        workaround: pedantic_workaround(opcode).to_string(),
+    }))
+}
+
+fn witness_opcode_variant(opcode: &Opcode<FieldElement>) -> &'static str {
+    match opcode {
+        Opcode::AssertZero(_) => "AssertZero",
+        Opcode::BlackBoxFuncCall(_) => "BlackBoxFuncCall",
+        Opcode::MemoryOp { .. } => "MemoryOp",
+        Opcode::MemoryInit { .. } => "MemoryInit",
+        Opcode::BrilligCall { .. } => "BrilligCall",
+        Opcode::Call { .. } => "Call",
+    }
+}
+
+fn pedantic_workaround(opcode: &Opcode<FieldElement>) -> &'static str {
+    match opcode {
+        Opcode::Call { .. } => {
+            "constrain Call predicates to boolean values (x * (x - 1) = 0) or use constant 0/1"
+        }
+        Opcode::BrilligCall { .. } => {
+            "constrain Brillig predicates to boolean values (x * (x - 1) = 0) or use constant 0/1"
+        }
+        Opcode::MemoryOp { .. } => {
+            "constrain memory operation selectors to boolean values (0=read, 1=write)"
+        }
+        Opcode::BlackBoxFuncCall(_) => {
+            "constrain blackbox predicates to boolean values or use constant 0/1"
+        }
+        Opcode::AssertZero(_) | Opcode::MemoryInit { .. } => {
+            "ensure opcode predicates/selectors are boolean"
+        }
+    }
 }
 
 fn flatten_value_for_param(
@@ -407,7 +719,7 @@ mod tests {
 
     use acir::{
         circuit::{
-            opcodes::{BlackBoxFuncCall, FunctionInput},
+            opcodes::{AcirFunctionId, BlackBoxFuncCall, FunctionInput},
             Circuit, Opcode, Program,
         },
         native_types::{Expression, Witness},
@@ -421,6 +733,63 @@ mod tests {
         noir_acir::AbiType {
             kind: "field".to_string(),
             extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn witness_default_options_enable_pedantic_mode() {
+        assert!(WitnessSolveOptions::default().pedantic_solving);
+    }
+
+    #[test]
+    fn pedantic_constant_check_rejects_non_boolean_call_predicate() {
+        let main = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::Call {
+                id: AcirFunctionId(1),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                predicate: Expression::from_field(FieldElement::from(2u128)),
+            }],
+            ..Circuit::default()
+        };
+        let callee = Circuit::default();
+
+        let artifact = Artifact {
+            noir_version: None,
+            abi: noir_acir::Abi {
+                parameters: Vec::new(),
+                return_type: None,
+                error_types: BTreeMap::new(),
+            },
+            program_bytes: Program::serialize_program(&Program {
+                functions: vec![main.clone(), callee.clone()],
+                unconstrained_functions: Vec::new(),
+            }),
+            program: Program {
+                functions: vec![main, callee],
+                unconstrained_functions: Vec::new(),
+            },
+        };
+
+        let err = generate_witness_with_options(
+            &artifact,
+            &serde_json::json!({}),
+            WitnessSolveOptions::pedantic(),
+        )
+        .expect_err("non-boolean predicate should fail in pedantic mode");
+
+        match err {
+            WitnessError::PedanticViolation(details) => {
+                assert_eq!(details.opcode, "Call");
+                assert_eq!(details.index, 0);
+                assert_eq!(details.function_id, 0);
+                assert!(details.predicate_state.contains("constant(2)"));
+                assert!(details
+                    .details
+                    .contains("predicate/operation must be 0 or 1"));
+            }
+            other => panic!("unexpected error: {other}"),
         }
     }
 

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test Workspace
+        run: cargo test --workspace
+
+  compatibility-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install noirup
+        run: curl -L https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash
+      - name: Add nargo to PATH
+        run: echo "$HOME/.nargo/bin" >> "$GITHUB_PATH"
+      - name: Install nargo v1.0.0-beta.19
+        run: noirup -v 1.0.0-beta.19
+      - name: Run Compatibility Corpus Differential Test
+        env:
+          NOIR_CORPUS_REQUIRE_NARGO: "1"
+        run: cargo test -p noir-cli compatibility_corpus_differential_checks -- --ignored --nocapture

@@ -277,4 +277,49 @@ fn allow_unsupported_writes_diagnostics_and_still_fails() {
         report.contains("BrilligCall"),
         "report should mention unsupported opcode variant, report={report}"
     );
+    assert!(
+        report.contains("\"function_id\""),
+        "report should include function id context, report={report}"
+    );
+    assert!(
+        report.contains("\"predicate_state\""),
+        "report should include predicate state, report={report}"
+    );
+    assert!(
+        report.contains("\"workaround\""),
+        "report should include workaround guidance, report={report}"
+    );
+}
+
+#[test]
+fn strict_mode_emits_actionable_unsupported_message() {
+    let artifact = fixture_path("unsupported_brillig_artifact.json");
+    let out_dir = TempDir::new().expect("temp dir should be created");
+    let out_path = out_dir.path().join("unsupported.r1cs.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_noir-cli"))
+        .arg("r1cs-json")
+        .arg(&artifact)
+        .arg("--out")
+        .arg(&out_path)
+        .output()
+        .expect("r1cs-json command should execute");
+
+    assert!(
+        !output.status.success(),
+        "strict r1cs-json should fail for unsupported opcode"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("function"),
+        "stderr should include function context: {stderr}"
+    );
+    assert!(
+        stderr.contains("predicate_state"),
+        "stderr should include predicate state: {stderr}"
+    );
+    assert!(
+        stderr.contains("workaround"),
+        "stderr should include workaround guidance: {stderr}"
+    );
 }

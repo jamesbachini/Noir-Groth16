@@ -54,19 +54,29 @@ impl Default for LoweringOptions {
 pub struct UnsupportedOpcodeInfo {
     pub opcode: String,
     pub index: usize,
+    pub function_id: usize,
+    pub opcode_variant: String,
+    pub predicate_state: String,
+    pub exact_opcode: String,
     pub details: String,
+    pub workaround: String,
 }
 
 #[derive(Debug, Error)]
 pub enum R1csError {
     #[error("program has no functions")]
     EmptyProgram,
-    #[error("unsupported opcode `{opcode}` at index {index}: {details}")]
-    UnsupportedOpcode {
-        opcode: String,
-        index: usize,
-        details: String,
-    },
+    #[error(
+        "unsupported opcode `{}` at index {} in function {} (predicate={}): {}; exact_opcode={}; workaround={}",
+        info.opcode,
+        info.index,
+        info.function_id,
+        info.predicate_state,
+        info.details,
+        info.exact_opcode,
+        info.workaround
+    )]
+    UnsupportedOpcode { info: Box<UnsupportedOpcodeInfo> },
     #[error("unsupported opcodes encountered during lowering")]
     UnsupportedOpcodes { opcodes: Vec<UnsupportedOpcodeInfo> },
     #[error("underconstrained wire {wire}: {reason}")]
@@ -1614,16 +1624,24 @@ impl<'a> LoweringContext<'a> {
         details: String,
     ) -> Result<(), R1csError> {
         let context = self.opcode_context(index);
+        let function_id = self.active_function_index();
+        let opcode_variant = self.active_opcode_variant(index);
+        let predicate_state = self.predicate_state_for_index(index);
+        let exact_opcode = self.exact_opcode_for_index(index);
+        let workaround = suggested_workaround(opcode);
         let info = UnsupportedOpcodeInfo {
             opcode: opcode.to_string(),
             index,
+            function_id,
+            opcode_variant,
+            predicate_state,
+            exact_opcode,
             details: format!("{details}; {context}"),
+            workaround,
         };
         match self.options.mode {
             LoweringMode::Strict => Err(R1csError::UnsupportedOpcode {
-                opcode: info.opcode,
-                index: info.index,
-                details: info.details,
+                info: Box::new(info),
             }),
             LoweringMode::AllowUnsupported => {
                 self.unsupported.push(info);
@@ -1632,19 +1650,61 @@ impl<'a> LoweringContext<'a> {
         }
     }
 
+    fn active_function_index(&self) -> usize {
+        self.call_stack
+            .last()
+            .copied()
+            .unwrap_or(self.current_function_index)
+    }
+
+    fn active_circuit(&self) -> Option<&AcirCircuit> {
+        if let Some(program) = self.program {
+            return program.functions.get(self.active_function_index());
+        }
+        Some(self.circuit)
+    }
+
+    fn active_opcode(&self, index: usize) -> Option<&AcirOpcode> {
+        self.active_circuit()?.opcodes.get(index)
+    }
+
+    fn active_opcode_variant(&self, index: usize) -> String {
+        self.active_opcode(index)
+            .map(|opcode| opcode_variant(opcode).to_string())
+            .unwrap_or_else(|| "NestedCallOpcode".to_string())
+    }
+
+    fn exact_opcode_for_index(&self, index: usize) -> String {
+        self.active_opcode(index)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "nested-call-opcode-unavailable".to_string())
+    }
+
+    fn predicate_state_for_index(&self, index: usize) -> String {
+        let Some(opcode) = self.active_opcode(index) else {
+            return "unknown".to_string();
+        };
+
+        match opcode {
+            Opcode::Call { predicate, .. } | Opcode::BrilligCall { predicate, .. } => {
+                expression_predicate_state(predicate)
+            }
+            Opcode::BlackBoxFuncCall(call) => blackbox_predicate_state(call),
+            Opcode::MemoryOp { op, .. } => expression_predicate_state(&op.operation),
+            Opcode::AssertZero(_) | Opcode::MemoryInit { .. } => "none".to_string(),
+        }
+    }
+
     fn opcode_context(&self, index: usize) -> String {
         let mut parts = Vec::new();
-        if let Some(opcode) = self.circuit.opcodes.get(index) {
+        if let Some(opcode) = self.active_opcode(index) {
             parts.push(format!("opcode_variant={}", opcode_variant(opcode)));
         } else {
             parts.push("opcode_variant=NestedCallOpcode".to_string());
-            parts.push(format!(
-                "caller_function_index={}",
-                self.current_function_index
-            ));
-            if let Some(callee) = self.call_stack.last() {
-                parts.push(format!("callee_function_index={callee}"));
-            }
+        }
+        parts.push(format!("function_id={}", self.active_function_index()));
+        if self.call_stack.len() > 1 {
+            parts.push(format!("call_stack={:?}", self.call_stack));
         }
         if let Some(assert_msg) = self.assert_message_for_index(index) {
             parts.push(format!("assert_message={assert_msg}"));
@@ -1653,7 +1713,8 @@ impl<'a> LoweringContext<'a> {
     }
 
     fn assert_message_for_index(&self, index: usize) -> Option<String> {
-        for (location, payload) in &self.circuit.assert_messages {
+        let circuit = self.active_circuit()?;
+        for (location, payload) in &circuit.assert_messages {
             if let OpcodeLocation::Acir(i) = *location {
                 if i == index {
                     return Some(format!(
@@ -2809,6 +2870,55 @@ fn opcode_variant(opcode: &AcirOpcode) -> &'static str {
     }
 }
 
+fn expression_predicate_state(expr: &AcirExpression) -> String {
+    match expr.to_const().copied() {
+        Some(value) if value.is_zero() => "constant(0)".to_string(),
+        Some(value) if value.is_one() => "constant(1)".to_string(),
+        Some(value) => format!("constant({value})"),
+        None => "dynamic".to_string(),
+    }
+}
+
+fn function_input_predicate_state(input: &AcirFunctionInput) -> String {
+    match input {
+        FunctionInput::Constant(value) if value.is_zero() => "constant(0)".to_string(),
+        FunctionInput::Constant(value) if value.is_one() => "constant(1)".to_string(),
+        FunctionInput::Constant(value) => format!("constant({value})"),
+        FunctionInput::Witness(witness) => format!("witness({})", witness.witness_index()),
+    }
+}
+
+fn blackbox_predicate_state(call: &AcirBlackBoxFuncCall) -> String {
+    match call {
+        BlackBoxFuncCall::AES128Encrypt { .. }
+        | BlackBoxFuncCall::AND { .. }
+        | BlackBoxFuncCall::XOR { .. }
+        | BlackBoxFuncCall::RANGE { .. }
+        | BlackBoxFuncCall::Blake2s { .. }
+        | BlackBoxFuncCall::Blake3 { .. }
+        | BlackBoxFuncCall::Keccakf1600 { .. }
+        | BlackBoxFuncCall::Poseidon2Permutation { .. }
+        | BlackBoxFuncCall::Sha256Compression { .. } => "constant(1)".to_string(),
+        BlackBoxFuncCall::EcdsaSecp256k1 { predicate, .. }
+        | BlackBoxFuncCall::EcdsaSecp256r1 { predicate, .. }
+        | BlackBoxFuncCall::MultiScalarMul { predicate, .. }
+        | BlackBoxFuncCall::EmbeddedCurveAdd { predicate, .. }
+        | BlackBoxFuncCall::RecursiveAggregation { predicate, .. } => {
+            function_input_predicate_state(predicate)
+        }
+    }
+}
+
+fn suggested_workaround(opcode: &str) -> String {
+    match opcode {
+        "Call" => "Constrain the Call predicate to boolean (0/1), avoid recursion, and ensure callee outputs are transitively constrained by AssertZero rows.".to_string(),
+        "BrilligCall" => "Constrain Brillig outputs with non-hint AssertZero/blackbox relations, or set predicate to constant 0 when outputs are intentionally unused.".to_string(),
+        "BlackBoxFuncCall" => "Use supported blackboxes or add explicit constraints tying every blackbox output into AssertZero equations; use --allow-unsupported to get full diagnostics.".to_string(),
+        "MemoryOp" | "MemoryInit" => "Ensure memory blocks are initialized, indices are valid, and memory operations/predicates evaluate to boolean values.".to_string(),
+        _ => "Rewrite the opcode into supported AssertZero/blackbox patterns and keep predicates boolean-constrained.".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet, fs, io::Cursor};
@@ -2949,15 +3059,15 @@ mod tests {
 
         let err = compile_r1cs_circuit(&circuit).expect_err("unsupported opcode should fail");
         match err {
-            R1csError::UnsupportedOpcode {
-                opcode,
-                index,
-                details,
-            } => {
-                assert_eq!(opcode, "BrilligCall");
-                assert_eq!(index, 0);
-                assert!(details.contains("at least one output witness"));
-                assert!(details.contains("opcode_variant=BrilligCall"));
+            R1csError::UnsupportedOpcode { info } => {
+                assert_eq!(info.opcode, "BrilligCall");
+                assert_eq!(info.index, 0);
+                assert_eq!(info.function_id, 0);
+                assert_eq!(info.predicate_state, "constant(1)");
+                assert!(info.exact_opcode.contains("BRILLIG CALL"));
+                assert!(info.details.contains("at least one output witness"));
+                assert!(info.details.contains("opcode_variant=BrilligCall"));
+                assert!(info.workaround.contains("Constrain Brillig outputs"));
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -3112,14 +3222,14 @@ mod tests {
         let err = compile_r1cs_circuit(&circuit)
             .expect_err("dynamic-predicate Brillig output must still be constrained");
         match err {
-            R1csError::UnsupportedOpcode {
-                opcode,
-                index,
-                details,
-            } => {
-                assert_eq!(opcode, "BrilligCall");
-                assert_eq!(index, 0);
-                assert!(details.contains("not constrained by non-hint R1CS rows"));
+            R1csError::UnsupportedOpcode { info } => {
+                assert_eq!(info.opcode, "BrilligCall");
+                assert_eq!(info.index, 0);
+                assert_eq!(info.function_id, 0);
+                assert_eq!(info.predicate_state, "dynamic");
+                assert!(info
+                    .details
+                    .contains("not constrained by non-hint R1CS rows"));
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -3736,6 +3846,14 @@ mod tests {
         assert_eq!(unsupported.len(), 2);
         assert_eq!(unsupported[0].index, 0);
         assert_eq!(unsupported[1].index, 1);
+        assert_eq!(unsupported[0].function_id, 0);
+        assert_eq!(unsupported[0].predicate_state, "constant(1)");
+        assert!(unsupported[0]
+            .workaround
+            .contains("Constrain Brillig outputs"));
+        assert!(unsupported[1]
+            .workaround
+            .contains("Constrain the Call predicate"));
     }
 
     #[test]

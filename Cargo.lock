@@ -1275,6 +1275,7 @@ dependencies = [
 name = "noir-cli"
 version = "0.1.0"
 dependencies = [
+ "acir 1.0.0-beta.19",
  "anyhow",
  "clap",
  "noir-acir",

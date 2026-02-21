@@ -73,6 +73,8 @@ Generate witness outputs from artifact + ABI-shaped inputs.
 noir-cli witness test-vectors/fixture_artifact.json test-vectors/fixture_inputs.json --out out/witness
 ```
 
+Pedantic solving is enabled by default. Pass `--no-pedantic` to disable strict predicate/selector checks.
+
 Outputs:
 - `out/witness/witness_map.json`
 - `out/witness/witness.bin`
@@ -96,6 +98,8 @@ Emit snarkjs-friendly iden3 binaries (`.r1cs` and `.wtns`).
 ```bash
 noir-cli interop test-vectors/fixture_artifact.json test-vectors/fixture_inputs.json --out out/interop
 ```
+
+Pedantic solving is enabled by default. Pass `--no-pedantic` to disable strict predicate/selector checks.
 
 Outputs:
 - `out/interop/circuit.r1cs`
@@ -183,6 +187,7 @@ Target assumptions:
 
 - Strict mode (default): fails immediately on unsupported/underconstrained behavior.
 - `--allow-unsupported`: collects unsupported opcode diagnostics and writes `unsupported_opcodes.json`, but still fails and does not emit final `.r1cs` / `.wtns`.
+- Witness solving mode defaults to pedantic predicate/selector validation. Use `--no-pedantic` on `witness`/`interop` only when intentionally matching legacy non-pedantic ACVM behavior.
 
 ## Development Workflow
 
@@ -199,6 +204,13 @@ Optional interop smoke test:
 ```bash
 npm i -g snarkjs
 cargo test -p noir-cli --features interop-test -- --ignored
+```
+
+Compatibility corpus differential test (compiles all real Noir projects under `examples/`, solves via ACVM, lowers to R1CS, checks satisfaction, then tamper-fails constrained wires):
+
+```bash
+nargo --version
+cargo test -p noir-cli compatibility_corpus_differential_checks -- --ignored --nocapture
 ```
 
 ## Disclaimer

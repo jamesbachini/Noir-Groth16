@@ -16,4 +16,5 @@ noir-r1cs = { path = "../noir-r1cs" }
 noir-witness = { path = "../noir-witness" }
 
 [dev-dependencies]
+acir.workspace = true
 tempfile.workspace = true

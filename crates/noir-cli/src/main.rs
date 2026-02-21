@@ -10,7 +10,10 @@ use noir_r1cs::{
     compile_r1cs, compile_r1cs_with_options, write_r1cs_binary, write_r1cs_json, LoweringOptions,
     R1csError, UnsupportedOpcodeInfo,
 };
-use noir_witness::{generate_witness, generate_witness_from_json_str, WitnessArtifacts};
+use noir_witness::{
+    generate_witness_from_json_str_with_options, generate_witness_with_options, WitnessArtifacts,
+    WitnessSolveOptions,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "noir-cli")]
@@ -34,6 +37,8 @@ enum Commands {
         inputs: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long, default_value_t = false)]
+        no_pedantic: bool,
     },
     /// Compile AssertZero ACIR into debug R1CS JSON.
     R1csJson {
@@ -51,6 +56,8 @@ enum Commands {
         out: PathBuf,
         #[arg(long, default_value_t = false)]
         allow_unsupported: bool,
+        #[arg(long, default_value_t = false)]
+        no_pedantic: bool,
     },
 }
 
@@ -62,7 +69,8 @@ fn main() -> Result<()> {
             artifact,
             inputs,
             out,
-        } => witness_cmd(&artifact, &inputs, &out),
+            no_pedantic,
+        } => witness_cmd(&artifact, &inputs, &out, !no_pedantic),
         Commands::R1csJson {
             artifact,
             out,
@@ -73,7 +81,8 @@ fn main() -> Result<()> {
             inputs,
             out,
             allow_unsupported,
-        } => interop_cmd(&artifact, &inputs, &out, allow_unsupported),
+            no_pedantic,
+        } => interop_cmd(&artifact, &inputs, &out, allow_unsupported, !no_pedantic),
     }
 }
 
@@ -106,13 +115,22 @@ fn compile_r1cs_cmd(artifact_path: &PathBuf, out_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn witness_cmd(artifact_path: &PathBuf, inputs_path: &PathBuf, out_dir: &PathBuf) -> Result<()> {
+fn witness_cmd(
+    artifact_path: &PathBuf,
+    inputs_path: &PathBuf,
+    out_dir: &PathBuf,
+    pedantic_solving: bool,
+) -> Result<()> {
     let artifact = load_artifact(artifact_path)?;
     let inputs = fs::read_to_string(inputs_path)
         .with_context(|| format!("failed reading inputs `{}`", inputs_path.display()))?;
 
-    let witness = generate_witness_from_json_str(&artifact, &inputs)
-        .context("failed generating witness from inputs")?;
+    let witness = generate_witness_from_json_str_with_options(
+        &artifact,
+        &inputs,
+        WitnessSolveOptions { pedantic_solving },
+    )
+    .context("failed generating witness from inputs")?;
 
     write_witness_outputs(&witness, out_dir)?;
 
@@ -157,6 +175,7 @@ fn interop_cmd(
     inputs_path: &PathBuf,
     out_dir: &PathBuf,
     allow_unsupported: bool,
+    pedantic_solving: bool,
 ) -> Result<()> {
     let artifact = load_artifact(artifact_path)?;
     let inputs = fs::read_to_string(inputs_path)
@@ -166,8 +185,12 @@ fn interop_cmd(
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed creating output dir `{}`", out_dir.display()))?;
-    let mut witness =
-        generate_witness(&artifact, &inputs_json).context("failed generating witness")?;
+    let mut witness = generate_witness_with_options(
+        &artifact,
+        &inputs_json,
+        WitnessSolveOptions { pedantic_solving },
+    )
+    .context("failed generating witness")?;
     let diagnostics_path = out_dir.join("unsupported_opcodes.json");
     let system = compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path))
         .context("failed compiling R1CS")?;
@@ -198,7 +221,20 @@ fn compile_r1cs_for_command(
     diagnostics_path: Option<&PathBuf>,
 ) -> Result<noir_r1cs::R1csSystem> {
     if !allow_unsupported {
-        return compile_r1cs(&artifact.program).context("strict lowering failed");
+        return match compile_r1cs(&artifact.program) {
+            Ok(system) => Ok(system),
+            Err(R1csError::UnsupportedOpcode { info }) => anyhow::bail!(
+                "strict lowering failed: unsupported opcode `{}` at index {} in function {}\n  predicate_state: {}\n  exact_opcode: {}\n  details: {}\n  workaround: {}",
+                info.opcode,
+                info.index,
+                info.function_id,
+                info.predicate_state,
+                info.exact_opcode,
+                info.details,
+                info.workaround
+            ),
+            Err(err) => Err(err).context("strict lowering failed"),
+        };
     }
 
     match compile_r1cs_with_options(&artifact.program, LoweringOptions::allow_unsupported()) {
@@ -207,6 +243,9 @@ fn compile_r1cs_for_command(
             if let Some(path) = diagnostics_path {
                 write_unsupported_report(path, &opcodes)?;
                 eprintln!("unsupported opcode report written to `{}`", path.display());
+            }
+            if let Some(first) = opcodes.first() {
+                eprintln!("{}", format_unsupported_opcode(first));
             }
             anyhow::bail!(
                 "unsupported opcodes encountered; no R1CS/WTNS emitted (use diagnostics report for details)"
@@ -224,6 +263,19 @@ fn write_unsupported_report(path: &PathBuf, opcodes: &[UnsupportedOpcodeInfo]) -
     fs::write(path, serde_json::to_vec_pretty(&payload)?)
         .with_context(|| format!("failed writing `{}`", path.display()))?;
     Ok(())
+}
+
+fn format_unsupported_opcode(info: &UnsupportedOpcodeInfo) -> String {
+    format!(
+        "unsupported opcode `{}` at index {} in function {} (predicate={})\n  exact_opcode: {}\n  details: {}\n  workaround: {}",
+        info.opcode,
+        info.index,
+        info.function_id,
+        info.predicate_state,
+        info.exact_opcode,
+        info.details,
+        info.workaround
+    )
 }
 
 fn unsupported_report_path_for_r1cs_json(out_path: &Path) -> PathBuf {
