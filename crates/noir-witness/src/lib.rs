@@ -12,7 +12,7 @@ use acir::{
     native_types::{Witness, WitnessMap},
     AcirField, FieldElement,
 };
-use acvm::pwg::{ACVMStatus, ACVM};
+use acvm::pwg::{ACVMStatus, OpcodeResolutionError, ResolvedAssertionPayload, ACVM};
 use bn254_blackbox_solver::Bn254BlackBoxSolver;
 use noir_acir::{AbiParameter, AbiType, Artifact, ArtifactError};
 use serde::Deserialize;
@@ -245,7 +245,7 @@ pub fn generate_witness_with_options(
     match acvm.solve() {
         ACVMStatus::Solved => {}
         ACVMStatus::Failure(err) => {
-            return Err(WitnessError::SolverFailed(err.to_string()));
+            return Err(WitnessError::SolverFailed(format_solver_error(&err)));
         }
         other => {
             return Err(WitnessError::UnsupportedAcvmStatus(other.to_string()));
@@ -262,6 +262,40 @@ pub fn generate_witness_with_options(
         witness_map,
         witness_vector,
     })
+}
+
+fn format_solver_error(err: &OpcodeResolutionError<FieldElement>) -> String {
+    match err {
+        OpcodeResolutionError::UnsatisfiedConstrain {
+            opcode_location,
+            payload,
+        } => {
+            let payload = payload
+                .as_ref()
+                .map(format_assertion_payload)
+                .unwrap_or_else(|| "no assertion payload".to_string());
+            format!(
+                "Cannot satisfy constraint at {opcode_location}; payload={payload}; debug={err:?}"
+            )
+        }
+        OpcodeResolutionError::BlackBoxFunctionFailed(func, reason) => {
+            format!("BlackBox function `{func}` failed: {reason}; debug={err:?}")
+        }
+        _ => format!("{err}; debug={err:?}"),
+    }
+}
+
+fn format_assertion_payload(payload: &ResolvedAssertionPayload<FieldElement>) -> String {
+    match payload {
+        ResolvedAssertionPayload::String(message) => message.clone(),
+        ResolvedAssertionPayload::Raw(raw) => {
+            format!(
+                "raw(selector={:?}, data_len={})",
+                raw.selector,
+                raw.data.len()
+            )
+        }
+    }
 }
 
 fn validate_pedantic_constant_checks(artifact: &Artifact) -> Result<(), WitnessError> {
@@ -806,6 +840,55 @@ mod tests {
             .expect("witness generation should succeed");
 
         assert_eq!(first.witness_bin(), second.witness_bin());
+    }
+
+    #[test]
+    fn solver_failure_includes_opcode_location_context() {
+        let circuit = Circuit {
+            current_witness_index: 1,
+            opcodes: vec![Opcode::AssertZero(Expression {
+                mul_terms: Vec::new(),
+                linear_combinations: vec![(FieldElement::one(), Witness(1))],
+                q_c: -FieldElement::one(),
+            })],
+            private_parameters: BTreeSet::from([Witness(1)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: vec![],
+        };
+        let artifact = Artifact {
+            noir_version: None,
+            abi: noir_acir::Abi {
+                parameters: vec![noir_acir::AbiParameter {
+                    name: "x".to_string(),
+                    typ: field_typ(),
+                    visibility: noir_acir::AbiVisibility::Private,
+                }],
+                return_type: None,
+                error_types: BTreeMap::new(),
+            },
+            program_bytes: Program::serialize_program(&program),
+            program,
+        };
+
+        let err = generate_witness(&artifact, &serde_json::json!({ "x": "2" }))
+            .expect_err("unsatisfied assertion should fail solving");
+
+        match err {
+            WitnessError::SolverFailed(message) => {
+                assert!(
+                    message.contains("Cannot satisfy constraint at"),
+                    "solver diagnostics should include opcode location context: {message}"
+                );
+                assert!(
+                    message.contains("UnsatisfiedConstrain"),
+                    "solver diagnostics should include structured ACVM error: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 
     #[test]

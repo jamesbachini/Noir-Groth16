@@ -289,6 +289,16 @@ fn allow_unsupported_writes_diagnostics_and_still_fails() {
         report.contains("\"workaround\""),
         "report should include workaround guidance, report={report}"
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported opcode count="),
+        "stderr should include unsupported count summary: {stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported summary by variant"),
+        "stderr should include unsupported variant summary: {stderr}"
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -244,6 +245,8 @@ fn compile_r1cs_for_command(
                 write_unsupported_report(path, &opcodes)?;
                 eprintln!("unsupported opcode report written to `{}`", path.display());
             }
+            eprintln!("unsupported opcode count={}", opcodes.len());
+            eprintln!("{}", format_unsupported_summary(&opcodes));
             if let Some(first) = opcodes.first() {
                 eprintln!("{}", format_unsupported_opcode(first));
             }
@@ -276,6 +279,45 @@ fn format_unsupported_opcode(info: &UnsupportedOpcodeInfo) -> String {
         info.details,
         info.workaround
     )
+}
+
+fn format_unsupported_summary(opcodes: &[UnsupportedOpcodeInfo]) -> String {
+    let mut by_variant = BTreeMap::<String, usize>::new();
+    let mut by_blackbox = BTreeMap::<String, usize>::new();
+
+    for info in opcodes {
+        *by_variant.entry(info.opcode_variant.clone()).or_default() += 1;
+        if let Some(name) = parse_blackbox_name(&info.exact_opcode) {
+            *by_blackbox.entry(name).or_default() += 1;
+        }
+    }
+
+    let variants = by_variant
+        .into_iter()
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if by_blackbox.is_empty() {
+        return format!("unsupported summary by variant: {variants}");
+    }
+
+    let blackboxes = by_blackbox
+        .into_iter()
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("unsupported summary by variant: {variants}; blackboxes: {blackboxes}")
+}
+
+fn parse_blackbox_name(exact_opcode: &str) -> Option<String> {
+    let suffix = exact_opcode.strip_prefix("BLACKBOX::")?;
+    let end = suffix.find(' ').unwrap_or(suffix.len());
+    let mut name = suffix[..end].to_string();
+    if let Some(stripped) = name.strip_suffix(':') {
+        name = stripped.to_string();
+    }
+    Some(name)
 }
 
 fn unsupported_report_path_for_r1cs_json(out_path: &Path) -> PathBuf {

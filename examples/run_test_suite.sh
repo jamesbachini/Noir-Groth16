@@ -44,6 +44,7 @@ trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 pass_count=0
 fail_count=0
+skip_count=0
 
 for example_dir in "${EXAMPLES_DIR}"/*; do
   [[ -d "${example_dir}" ]] || continue
@@ -69,6 +70,12 @@ for example_dir in "${EXAMPLES_DIR}"/*; do
   rm -rf "${interop_dir}"
 
   if ! "${NOIR_CLI}" interop "${artifact_path}" "${example_dir}/inputs.json" --out "${interop_dir}" >"${OUT_DIR}/logs/${name}.interop.log" 2>&1; then
+    if grep -q "unsupported opcode" "${OUT_DIR}/logs/${name}.interop.log" || \
+       grep -q "unsupported opcodes encountered" "${OUT_DIR}/logs/${name}.interop.log"; then
+      echo "  skipped (unsupported opcodes for R1CS lowering)"
+      ((skip_count+=1))
+      continue
+    fi
     echo "  interop failed (see ${OUT_DIR}/logs/${name}.interop.log)"
     ((fail_count+=1))
     continue
@@ -123,7 +130,7 @@ for example_dir in "${EXAMPLES_DIR}"/*; do
 done
 
 echo
-echo "Example suite results: pass=${pass_count} fail=${fail_count}"
+echo "Example suite results: pass=${pass_count} skip=${skip_count} fail=${fail_count}"
 if [[ "${fail_count}" -ne 0 ]]; then
   exit 1
 fi

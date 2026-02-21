@@ -28,6 +28,7 @@ Current examples:
 - `poseidon2_state_word`
 - `pedersen_hash`
 - `string_ascii_sum`
+- `full_features`
 
 ## Run the full example pipeline on all examples
 
@@ -39,7 +40,7 @@ From repository root:
 
 This runs:
 1. `nargo compile` for each example package.
-2. `noir-cli interop` to emit `.r1cs` and `.wtns`.
+2. `noir-cli interop` to emit `.r1cs` and `.wtns` (examples with unsupported opcodes are skipped).
 3. `snarkjs wtns check`.
 4. `snarkjs groth16 setup/prove/verify`.
 
