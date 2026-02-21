@@ -15,18 +15,6 @@ Full documentation available at:
 https://jamesbachini.github.io/Noir-Groth16/
 
 
-## Workspace Layout
-
-- `crates/noir-acir`: Noir artifact parsing (including base64/legacy-compatible bytecode decoding), ABI modeling, witness layout helpers.
-- `crates/noir-witness`: ABI input flattening, pedantic-by-default ACVM witness solving, witness emitters.
-- `crates/noir-r1cs`: ACIR lowering, strict/diagnostic unsupported handling, and `.r1cs` / debug JSON writers.
-- `crates/noir-cli`: CLI entrypoints.
-- `circuits/`: default Noir circuit package used by the one-command proof script.
-- `scripts/run_circuit.sh`: compile + prove + verify runner for `circuits/`.
-- `examples/`: Noir example packages used by compatibility tests.
-- `test-vectors/`: Fixture artifacts + inputs used by tests.
-
-
 ## Quickstart (Single Command)
 
 Prerequisites:
@@ -164,6 +152,18 @@ Target assumptions:
 - Strict mode (default): fails immediately on unsupported/underconstrained behavior.
 - `--allow-unsupported`: collects unsupported opcode diagnostics and writes `unsupported_opcodes.json` (for `r1cs-json` and `interop`), but still fails and does not emit final `.r1cs` / `.wtns`.
 - Witness solving mode defaults to pedantic predicate/selector validation. Use `--no-pedantic` on `witness`/`interop` only when intentionally matching legacy non-pedantic ACVM behavior.
+
+
+## Workspace Layout
+
+- `crates/noir-acir`: Noir artifact parsing (including base64/legacy-compatible bytecode decoding), ABI modeling, witness layout helpers.
+- `crates/noir-witness`: ABI input flattening, pedantic-by-default ACVM witness solving, witness emitters.
+- `crates/noir-r1cs`: ACIR lowering, strict/diagnostic unsupported handling, and `.r1cs` / debug JSON writers.
+- `crates/noir-cli`: CLI entrypoints.
+- `circuits/`: default Noir circuit package used by the one-command proof script.
+- `scripts/run_circuit.sh`: compile + prove + verify runner for `circuits/`.
+- `examples/`: Noir example packages used by compatibility tests.
+- `test-vectors/`: Fixture artifacts + inputs used by tests.
 
 
 ## Development Workflow
