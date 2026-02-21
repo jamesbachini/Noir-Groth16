@@ -5,7 +5,7 @@ Noir-Groth16 is a Rust workspace that turns Noir artifacts into deterministic wi
 Pipeline:
 1. Parse Noir artifact JSON + ABI metadata.
 2. Build and solve witnesses with ACVM from ABI-shaped inputs.
-3. Lower supported ACIR constraints into R1CS.
+3. Lower supported ACIR opcodes into R1CS.
 4. Emit deterministic artifacts (`.r1cs`, `.wtns`, JSON/bin debug outputs).
 
 
@@ -17,9 +17,9 @@ https://jamesbachini.github.io/Noir-Groth16/
 
 ## Workspace Layout
 
-- `crates/noir-acir`: Noir artifact parsing, ABI modeling, witness layout helpers.
-- `crates/noir-witness`: ABI input flattening, ACVM witness solving, witness emitters.
-- `crates/noir-r1cs`: ACIR lowering and `.r1cs` / debug JSON writers.
+- `crates/noir-acir`: Noir artifact parsing (including base64/legacy-compatible bytecode decoding), ABI modeling, witness layout helpers.
+- `crates/noir-witness`: ABI input flattening, pedantic-by-default ACVM witness solving, witness emitters.
+- `crates/noir-r1cs`: ACIR lowering, strict/diagnostic unsupported handling, and `.r1cs` / debug JSON writers.
 - `crates/noir-cli`: CLI entrypoints.
 - `examples/`: Noir example packages (including `examples/demo`).
 - `test-vectors/`: Fixture artifacts + inputs used by tests.
@@ -180,7 +180,7 @@ Target assumptions:
 | `AssertZero(Expression)` | Supported | Canonical lowering with deterministic row/wire ordering. |
 | `MemoryInit { .. }` | Supported | Deterministic memory block initialization. |
 | `MemoryOp { .. }` | Supported (with checks) | Static/dynamic memory access lowering; invalid block/index forms fail loudly. |
-| `BlackBoxFuncCall(BlackBoxFuncCall)` | Partially supported | Native lowering for `AND`, `XOR`, and `RANGE` (exact for `num_bits <= 253`; tautological acceptance for `num_bits >= 254` on BN254). Other blackboxes are hint-lowered and require downstream constraints on outputs. |
+| `BlackBoxFuncCall(BlackBoxFuncCall)` | Partially supported | Native lowering for `AND`, `XOR`, `RANGE`, `Blake2s`, `Blake3`, `EcdsaSecp256k1`, `EcdsaSecp256r1`, `Poseidon2Permutation`, `Sha256Compression`, `MultiScalarMul`, and `EmbeddedCurveAdd`. Other blackboxes are hint-lowered and require downstream constraints on outputs. |
 | `BrilligCall { .. }` | Supported (guarded) | Lowered via hint plumbing; predicates must be boolean and outputs must be transitively constrained by non-hint rows. |
 | `Call { .. }` | Supported (guarded) | Non-recursive nested calls supported with predicate gating and output binding constraints. |
 
@@ -194,7 +194,7 @@ Target assumptions:
 ### Execution modes
 
 - Strict mode (default): fails immediately on unsupported/underconstrained behavior.
-- `--allow-unsupported`: collects unsupported opcode diagnostics and writes `unsupported_opcodes.json`, but still fails and does not emit final `.r1cs` / `.wtns`.
+- `--allow-unsupported`: collects unsupported opcode diagnostics and writes `unsupported_opcodes.json` (for `r1cs-json` and `interop`), but still fails and does not emit final `.r1cs` / `.wtns`.
 - Witness solving mode defaults to pedantic predicate/selector validation. Use `--no-pedantic` on `witness`/`interop` only when intentionally matching legacy non-pedantic ACVM behavior.
 
 

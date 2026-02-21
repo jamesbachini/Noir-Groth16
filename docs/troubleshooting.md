@@ -24,7 +24,7 @@ Cause:
 
 Fix:
 
-- Refactor Noir code toward currently supported assertion paths when possible.
+- Refactor Noir code toward currently supported opcode/lowering paths when possible.
 - Run with `--allow-unsupported` to generate diagnostics and identify exact opcode/function index.
 - Treat diagnostics as debugging output; proving artifacts are not emitted for unsupported lowering.
 

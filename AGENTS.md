@@ -10,32 +10,34 @@ The practical pipeline is:
 
 1. Load Noir artifact JSON and ABI metadata.
 2. Build witnesses from user inputs via ACVM.
-3. Lower supported ACIR assertions into R1CS.
+3. Lower supported ACIR opcodes into R1CS.
 4. Emit deterministic `.r1cs` / `.wtns` artifacts for interop (`snarkjs`) and downstream verifiers.
 
 Primary target assumptions:
 - Field: BN254.
 - Interop format: iden3 `.r1cs` and `.wtns`.
-- Constraint lowering focus: `AssertZero` path, with strict handling of unsupported or underconstrained behavior.
+- Constraint lowering covers `AssertZero`, memory ops, guarded `Call`/`Brillig`, and selected native blackboxes, with strict handling of unsupported or underconstrained behavior.
 
 ## 2) Workspace map
 
 - `crates/noir-acir`
-  - Parses Noir artifact JSON.
-  - Exposes program summary, ABI layout, and witness metadata.
+  - Parses Noir artifact JSON (including base64/legacy bytecode compatibility upgrades).
+  - Exposes program summary, ABI layout, witness metadata, and deterministic witness layout assignment checks.
 
 - `crates/noir-witness`
   - Converts ABI-shaped user input into ACVM initial witness values.
-  - Runs witness solving.
+  - Runs witness solving (pedantic by default).
   - Writes deterministic witness outputs (`witness_map.json`, `witness.bin`, `.wtns`).
 
 - `crates/noir-r1cs`
-  - Lowers supported ACIR opcodes to R1CS constraints.
+  - Lowers supported ACIR opcodes to R1CS constraints with strict/diagnostic unsupported modes.
+  - Natively lowers `AND`, `XOR`, `RANGE`, `Blake2s`, `Blake3`, `EcdsaSecp256k1`, `EcdsaSecp256r1`, `Poseidon2Permutation`, `Sha256Compression`, `MultiScalarMul`, and `EmbeddedCurveAdd`.
   - Owns wire mapping and iden3 `.r1cs` serialization.
 
 - `crates/noir-cli`
   - User-facing command surface.
   - Main commands: `compile-r1cs`, `witness`, `r1cs-json`, `interop`.
+  - `r1cs-json`/`interop` with `--allow-unsupported` emit `unsupported_opcodes.json` diagnostics but still exit non-zero on unsupported lowering.
 
 - `test-vectors/`
   - Minimal fixtures used by CLI and interop tests.
@@ -94,7 +96,7 @@ Run these before opening a PR:
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets --all-features -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 

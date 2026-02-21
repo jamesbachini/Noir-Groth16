@@ -91,9 +91,10 @@ Writes on success:
 Options:
 
 - `--no-pedantic`: disables pedantic witness solving checks.
-- `--allow-unsupported`: requests unsupported-opcode diagnostics.
+- `--allow-unsupported`: enables unsupported-opcode diagnostics.
 
 Important behavior:
 
 - If unsupported opcodes are encountered in strict lowering, the command exits non-zero.
+- When `--allow-unsupported` is set, `<OUT_DIR>/unsupported_opcodes.json` is written for debugging.
 - `.r1cs`/`.wtns` are only emitted on successful lowering and witness generation.
