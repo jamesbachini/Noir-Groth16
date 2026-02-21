@@ -5649,13 +5649,36 @@ mod tests {
         };
         let system =
             compile_r1cs(&program).expect("Sha256Compression witnesses should lower natively");
-        assert!(
-            system.n_constraints > 5_000,
-            "native Sha256Compression lowering should emit substantially more rows than 24 range checks"
-        );
 
-        let baseline_range_rows = 24 * 33;
-        assert!(system.n_constraints as usize > baseline_range_rows);
+        let constant_circuit =
+            Circuit {
+                current_witness_index: 7,
+                opcodes: vec![Opcode::BlackBoxFuncCall(
+                    BlackBoxFuncCall::Sha256Compression {
+                        inputs: Box::new([0u32; 16].map(|word| {
+                            FunctionInput::Constant(FieldElement::from(u128::from(word)))
+                        })),
+                        hash_values: Box::new([0u32; 8].map(|word| {
+                            FunctionInput::Constant(FieldElement::from(u128::from(word)))
+                        })),
+                        outputs: Box::new(std::array::from_fn(|index| Witness(index as u32))),
+                    },
+                )],
+                ..Circuit::default()
+            };
+        let constant_program = Program {
+            functions: vec![constant_circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let constant_system = compile_r1cs(&constant_program)
+            .expect("Sha256Compression constants should lower natively");
+
+        assert!(
+            system.n_constraints > constant_system.n_constraints + 1_000,
+            "witness-input Sha256Compression should emit a large native relation (got {} vs constant path {})",
+            system.n_constraints,
+            constant_system.n_constraints
+        );
     }
 
     #[test]
