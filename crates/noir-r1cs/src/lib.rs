@@ -234,6 +234,23 @@ enum ResolvedBlackBoxPredicate {
     Wire(u32),
 }
 
+#[derive(Clone, Debug)]
+struct Sha256Word {
+    wire: u32,
+    bits: Vec<u32>,
+}
+
+const SHA256_ROUND_CONSTANTS: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
 impl<'a> LoweringContext<'a> {
     fn new_for_program(
         program: &'a AcirProgram,
@@ -1610,46 +1627,54 @@ impl<'a> LoweringContext<'a> {
             self.lower_range(hash_value, 32, opcode_index)?;
         }
 
+        let all_inputs_constant = inputs
+            .iter()
+            .all(|input| matches!(input, FunctionInput::Constant(_)));
+        let all_hash_values_constant = hash_values
+            .iter()
+            .all(|hash_value| matches!(hash_value, FunctionInput::Constant(_)));
+
+        if !(all_inputs_constant && all_hash_values_constant) {
+            return self.lower_sha256_compression_relation(
+                inputs,
+                hash_values,
+                outputs,
+                opcode_index,
+            );
+        }
+
         let mut message = [0u32; 16];
         for (index, input) in inputs.iter().enumerate() {
-            match input {
-                FunctionInput::Constant(value) => {
-                    let Some(word) = value.try_to_u32() else {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!(
-                                "Sha256Compression constant input word must fit into 32 bits, found {value}"
-                            ),
-                        );
-                    };
-                    message[index] = word;
-                }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_as_hint(call, opcode_index)
-                }
-            }
+            let FunctionInput::Constant(value) = input else {
+                unreachable!("all inputs are constants")
+            };
+            let Some(word) = value.try_to_u32() else {
+                return self.unsupported_opcode(
+                    "BlackBoxFuncCall",
+                    opcode_index,
+                    format!(
+                        "Sha256Compression constant input word must fit into 32 bits, found {value}"
+                    ),
+                );
+            };
+            message[index] = word;
         }
 
         let mut state = [0u32; 8];
         for (index, hash_value) in hash_values.iter().enumerate() {
-            match hash_value {
-                FunctionInput::Constant(value) => {
-                    let Some(word) = value.try_to_u32() else {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!(
-                                "Sha256Compression constant hash value must fit into 32 bits, found {value}"
-                            ),
-                        );
-                    };
-                    state[index] = word;
-                }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_as_hint(call, opcode_index)
-                }
-            }
+            let FunctionInput::Constant(value) = hash_value else {
+                unreachable!("all hash values are constants")
+            };
+            let Some(word) = value.try_to_u32() else {
+                return self.unsupported_opcode(
+                    "BlackBoxFuncCall",
+                    opcode_index,
+                    format!(
+                        "Sha256Compression constant hash value must fit into 32 bits, found {value}"
+                    ),
+                );
+            };
+            state[index] = word;
         }
 
         sha256_compression(&mut state, &message);
@@ -1660,6 +1685,309 @@ impl<'a> LoweringContext<'a> {
         }
 
         Ok(())
+    }
+
+    fn lower_sha256_compression_relation(
+        &mut self,
+        inputs: &[AcirFunctionInput; 16],
+        hash_values: &[AcirFunctionInput; 8],
+        outputs: &[Witness; 8],
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+
+        let mut schedule = Vec::with_capacity(64);
+        for (index, input) in inputs.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Sha256Compression input[{index}]");
+            schedule.push(self.sha256_word_from_input(input, opcode_index, &context)?);
+        }
+        for index in 16..64 {
+            let sigma0_bits = self.sha256_xor3_bits(
+                &Self::sha256_right_rotate_bits(&schedule[index - 15].bits, 7),
+                &Self::sha256_right_rotate_bits(&schedule[index - 15].bits, 18),
+                &Self::sha256_right_shift_bits(&schedule[index - 15].bits, 3, zero_wire),
+            )?;
+            let sigma0 = self.sha256_word_from_bits(sigma0_bits)?;
+
+            let sigma1_bits = self.sha256_xor3_bits(
+                &Self::sha256_right_rotate_bits(&schedule[index - 2].bits, 17),
+                &Self::sha256_right_rotate_bits(&schedule[index - 2].bits, 19),
+                &Self::sha256_right_shift_bits(&schedule[index - 2].bits, 10, zero_wire),
+            )?;
+            let sigma1 = self.sha256_word_from_bits(sigma1_bits)?;
+
+            let word = self.sha256_add_mod_u32(
+                &[
+                    schedule[index - 16].wire,
+                    sigma0.wire,
+                    schedule[index - 7].wire,
+                    sigma1.wire,
+                ],
+                0,
+                opcode_index,
+                "BlackBoxFuncCall::Sha256Compression schedule word",
+            )?;
+            schedule.push(word);
+        }
+
+        let mut initial_state = Vec::with_capacity(8);
+        for (index, hash_value) in hash_values.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Sha256Compression hash value[{index}]");
+            initial_state.push(self.sha256_word_from_input(hash_value, opcode_index, &context)?);
+        }
+
+        let mut a = initial_state[0].clone();
+        let mut b = initial_state[1].clone();
+        let mut c = initial_state[2].clone();
+        let mut d = initial_state[3].clone();
+        let mut e = initial_state[4].clone();
+        let mut f = initial_state[5].clone();
+        let mut g = initial_state[6].clone();
+        let mut h = initial_state[7].clone();
+
+        for round in 0..64 {
+            let big_sigma1_bits = self.sha256_xor3_bits(
+                &Self::sha256_right_rotate_bits(&e.bits, 6),
+                &Self::sha256_right_rotate_bits(&e.bits, 11),
+                &Self::sha256_right_rotate_bits(&e.bits, 25),
+            )?;
+            let big_sigma1 = self.sha256_word_from_bits(big_sigma1_bits)?;
+
+            let e_and_f = self.sha256_and_bits(&e.bits, &f.bits)?;
+            let not_e = self.sha256_not_bits(&e.bits)?;
+            let not_e_and_g = self.sha256_and_bits(&not_e, &g.bits)?;
+            let ch_bits = self.sha256_xor_bits(&e_and_f, &not_e_and_g)?;
+            let ch = self.sha256_word_from_bits(ch_bits)?;
+
+            let temp1 = self.sha256_add_mod_u32(
+                &[h.wire, big_sigma1.wire, ch.wire, schedule[round].wire],
+                SHA256_ROUND_CONSTANTS[round],
+                opcode_index,
+                "BlackBoxFuncCall::Sha256Compression temp1",
+            )?;
+
+            let big_sigma0_bits = self.sha256_xor3_bits(
+                &Self::sha256_right_rotate_bits(&a.bits, 2),
+                &Self::sha256_right_rotate_bits(&a.bits, 13),
+                &Self::sha256_right_rotate_bits(&a.bits, 22),
+            )?;
+            let big_sigma0 = self.sha256_word_from_bits(big_sigma0_bits)?;
+
+            let a_and_b = self.sha256_and_bits(&a.bits, &b.bits)?;
+            let a_and_c = self.sha256_and_bits(&a.bits, &c.bits)?;
+            let b_and_c = self.sha256_and_bits(&b.bits, &c.bits)?;
+            let maj_bits = self.sha256_xor3_bits(&a_and_b, &a_and_c, &b_and_c)?;
+            let maj = self.sha256_word_from_bits(maj_bits)?;
+
+            let temp2 = self.sha256_add_mod_u32(
+                &[big_sigma0.wire, maj.wire],
+                0,
+                opcode_index,
+                "BlackBoxFuncCall::Sha256Compression temp2",
+            )?;
+
+            let next_e = self.sha256_add_mod_u32(
+                &[d.wire, temp1.wire],
+                0,
+                opcode_index,
+                "BlackBoxFuncCall::Sha256Compression next e",
+            )?;
+            let next_a = self.sha256_add_mod_u32(
+                &[temp1.wire, temp2.wire],
+                0,
+                opcode_index,
+                "BlackBoxFuncCall::Sha256Compression next a",
+            )?;
+
+            h = g;
+            g = f;
+            f = e;
+            e = next_e;
+            d = c;
+            c = b;
+            b = a;
+            a = next_a;
+        }
+
+        let state_words = [a, b, c, d, e, f, g, h];
+        let mut final_state = Vec::with_capacity(8);
+        for (index, value) in state_words.iter().enumerate() {
+            final_state.push(self.sha256_add_mod_u32(
+                &[initial_state[index].wire, value.wire],
+                0,
+                opcode_index,
+                "BlackBoxFuncCall::Sha256Compression final state word",
+            )?);
+        }
+
+        for (index, output) in outputs.iter().enumerate() {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Sha256Compression output")?;
+            let output_wire = self.wire_for_witness(*output)?;
+            self.enforce_wire_equality(output_wire, final_state[index].wire)?;
+        }
+
+        Ok(())
+    }
+
+    fn sha256_word_from_input(
+        &mut self,
+        input: &AcirFunctionInput,
+        opcode_index: usize,
+        context: &str,
+    ) -> Result<Sha256Word, R1csError> {
+        let wire = self.resolve_blackbox_function_input_wire(input, context)?;
+        let bits = self.decompose_wire_to_bits(wire, 32, opcode_index, context)?;
+        Ok(Sha256Word { wire, bits })
+    }
+
+    fn sha256_word_from_bits(&mut self, bits: Vec<u32>) -> Result<Sha256Word, R1csError> {
+        let mut terms = Vec::with_capacity(bits.len());
+        let mut coeff = FieldElement::one();
+        for bit in &bits {
+            terms.push((*bit, coeff));
+            coeff += coeff;
+        }
+        let wire = self.constrain_linear_combination_to_new_wire(&terms, FieldElement::zero())?;
+        Ok(Sha256Word { wire, bits })
+    }
+
+    fn sha256_add_mod_u32(
+        &mut self,
+        operands: &[u32],
+        constant: u32,
+        opcode_index: usize,
+        context: &str,
+    ) -> Result<Sha256Word, R1csError> {
+        let result_wire = self.allocate_intermediate_wire();
+        let result_bits = self.decompose_wire_to_bits(result_wire, 32, opcode_index, context)?;
+
+        let mut carry_bound = operands.len();
+        if constant != 0 {
+            carry_bound += 1;
+        }
+        let mut carry_bits = 1u32;
+        let mut max_carry = carry_bound.saturating_sub(1);
+        while max_carry > 1 {
+            carry_bits += 1;
+            max_carry >>= 1;
+        }
+
+        let carry_wire = self.allocate_intermediate_wire();
+        let _ = self.decompose_wire_to_bits(carry_wire, carry_bits, opcode_index, context)?;
+
+        let two_to_32 = FieldElement::from(1u128 << 32);
+        let mut linear_terms: BTreeMap<u32, FieldElement> = BTreeMap::new();
+        for operand in operands {
+            add_linear(&mut linear_terms, *operand, FieldElement::one());
+        }
+        add_linear(&mut linear_terms, result_wire, -FieldElement::one());
+        add_linear(&mut linear_terms, carry_wire, -two_to_32);
+        if constant != 0 {
+            add_linear(
+                &mut linear_terms,
+                0,
+                FieldElement::from(u128::from(constant)),
+            );
+        }
+
+        self.emit_constraint(
+            vec![SparseTerm {
+                wire: 0,
+                coeff: FieldElement::one(),
+            }],
+            linear_terms
+                .into_iter()
+                .map(|(wire, coeff)| SparseTerm { wire, coeff })
+                .collect(),
+            Vec::new(),
+        )?;
+
+        Ok(Sha256Word {
+            wire: result_wire,
+            bits: result_bits,
+        })
+    }
+
+    fn sha256_right_rotate_bits(bits: &[u32], amount: usize) -> Vec<u32> {
+        let width = bits.len();
+        (0..width)
+            .map(|index| bits[(index + amount) % width])
+            .collect()
+    }
+
+    fn sha256_right_shift_bits(bits: &[u32], amount: usize, zero_wire: u32) -> Vec<u32> {
+        let width = bits.len();
+        (0..width)
+            .map(|index| {
+                if index + amount < width {
+                    bits[index + amount]
+                } else {
+                    zero_wire
+                }
+            })
+            .collect()
+    }
+
+    fn sha256_xor_bits(&mut self, lhs: &[u32], rhs: &[u32]) -> Result<Vec<u32>, R1csError> {
+        let mut out = Vec::with_capacity(lhs.len());
+        for (lhs_bit, rhs_bit) in lhs.iter().zip(rhs.iter()) {
+            let product = self.multiply_wires(*lhs_bit, *rhs_bit)?;
+            let output = self.allocate_intermediate_wire();
+            self.emit_constraint(
+                vec![SparseTerm {
+                    wire: 0,
+                    coeff: FieldElement::one(),
+                }],
+                vec![
+                    SparseTerm {
+                        wire: *lhs_bit,
+                        coeff: FieldElement::one(),
+                    },
+                    SparseTerm {
+                        wire: *rhs_bit,
+                        coeff: FieldElement::one(),
+                    },
+                    SparseTerm {
+                        wire: product,
+                        coeff: -FieldElement::from(2u128),
+                    },
+                    SparseTerm {
+                        wire: output,
+                        coeff: -FieldElement::one(),
+                    },
+                ],
+                Vec::new(),
+            )?;
+            self.enforce_boolean_wire(output)?;
+            out.push(output);
+        }
+        Ok(out)
+    }
+
+    fn sha256_xor3_bits(
+        &mut self,
+        first: &[u32],
+        second: &[u32],
+        third: &[u32],
+    ) -> Result<Vec<u32>, R1csError> {
+        let partial = self.sha256_xor_bits(first, second)?;
+        self.sha256_xor_bits(&partial, third)
+    }
+
+    fn sha256_and_bits(&mut self, lhs: &[u32], rhs: &[u32]) -> Result<Vec<u32>, R1csError> {
+        let mut out = Vec::with_capacity(lhs.len());
+        for (lhs_bit, rhs_bit) in lhs.iter().zip(rhs.iter()) {
+            out.push(self.boolean_and_wires(*lhs_bit, *rhs_bit)?);
+        }
+        Ok(out)
+    }
+
+    fn sha256_not_bits(&mut self, bits: &[u32]) -> Result<Vec<u32>, R1csError> {
+        let mut out = Vec::with_capacity(bits.len());
+        for bit in bits {
+            out.push(self.boolean_not_wire(*bit)?);
+        }
+        Ok(out)
     }
 
     fn lower_ecdsa_with_constant_folding(
@@ -4436,8 +4764,8 @@ mod tests {
             FieldElement::from(2u128),
             FieldElement::one(),
         ];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
     }
 
     #[test]
@@ -4559,8 +4887,8 @@ mod tests {
             outputs[2],
             outputs[3],
         ];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[6] += FieldElement::one();
@@ -4628,8 +4956,8 @@ mod tests {
             output_infinite,
             FieldElement::one(),
         ];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[8] += FieldElement::one();
@@ -4692,6 +5020,121 @@ mod tests {
         let mut tampered = witness.clone();
         tampered[9] = FieldElement::zero();
         assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn embedded_curve_add_opposite_points_force_infinity_branch() {
+        let circuit = Circuit {
+            current_witness_index: 8,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::EmbeddedCurveAdd {
+                    input1: Box::new([
+                        FunctionInput::Witness(Witness(0)),
+                        FunctionInput::Witness(Witness(1)),
+                        FunctionInput::Witness(Witness(2)),
+                    ]),
+                    input2: Box::new([
+                        FunctionInput::Witness(Witness(3)),
+                        FunctionInput::Witness(Witness(4)),
+                        FunctionInput::Witness(Witness(5)),
+                    ]),
+                    predicate: FunctionInput::Constant(FieldElement::one()),
+                    outputs: (Witness(6), Witness(7), Witness(8)),
+                },
+            )],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system = compile_r1cs(&program).expect("embedded curve add should lower natively");
+
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+        let witness = vec![
+            FieldElement::one(),
+            generator_x,
+            generator_y,
+            FieldElement::zero(),
+            generator_x,
+            -generator_y,
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+        ];
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered = witness.clone();
+        tampered[7] = FieldElement::one();
+        assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn embedded_curve_add_rejects_infinite_input_when_predicate_true() {
+        let circuit = Circuit {
+            current_witness_index: 8,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::EmbeddedCurveAdd {
+                    input1: Box::new([
+                        FunctionInput::Witness(Witness(0)),
+                        FunctionInput::Witness(Witness(1)),
+                        FunctionInput::Witness(Witness(2)),
+                    ]),
+                    input2: Box::new([
+                        FunctionInput::Witness(Witness(3)),
+                        FunctionInput::Witness(Witness(4)),
+                        FunctionInput::Witness(Witness(5)),
+                    ]),
+                    predicate: FunctionInput::Constant(FieldElement::one()),
+                    outputs: (Witness(6), Witness(7), Witness(8)),
+                },
+            )],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system = compile_r1cs(&program).expect("embedded curve add should lower natively");
+
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+        let witness = vec![
+            FieldElement::one(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+            generator_x,
+            generator_y,
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+        ];
+        assert!(!system.is_satisfied(&witness));
     }
 
     #[test]
@@ -5178,6 +5621,41 @@ mod tests {
         let mut tampered = witness.clone();
         tampered[4] += FieldElement::one();
         assert!(!system.is_satisfied(&tampered));
+    }
+
+    #[test]
+    fn sha256_compression_witness_inputs_emit_native_relation_rows() {
+        let inputs: [FunctionInput<FieldElement>; 16] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(index as u32)));
+        let hash_values: [FunctionInput<FieldElement>; 8] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness((16 + index) as u32)));
+        let outputs: [Witness; 8] = std::array::from_fn(|index| Witness((24 + index) as u32));
+
+        let circuit = Circuit {
+            current_witness_index: 31,
+            opcodes: vec![Opcode::BlackBoxFuncCall(
+                BlackBoxFuncCall::Sha256Compression {
+                    inputs: Box::new(inputs),
+                    hash_values: Box::new(hash_values),
+                    outputs: Box::new(outputs),
+                },
+            )],
+            private_parameters: BTreeSet::from_iter((0..24).map(Witness)),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system =
+            compile_r1cs(&program).expect("Sha256Compression witnesses should lower natively");
+        assert!(
+            system.n_constraints > 5_000,
+            "native Sha256Compression lowering should emit substantially more rows than 24 range checks"
+        );
+
+        let baseline_range_rows = 24 * 33;
+        assert!(system.n_constraints as usize > baseline_range_rows);
     }
 
     #[test]
