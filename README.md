@@ -21,43 +21,58 @@ https://jamesbachini.github.io/Noir-Groth16/
 - `crates/noir-witness`: ABI input flattening, pedantic-by-default ACVM witness solving, witness emitters.
 - `crates/noir-r1cs`: ACIR lowering, strict/diagnostic unsupported handling, and `.r1cs` / debug JSON writers.
 - `crates/noir-cli`: CLI entrypoints.
-- `examples/`: Noir example packages (including `examples/demo`).
+- `circuits/`: default Noir circuit package used by the one-command proof script.
+- `scripts/run_circuit.sh`: compile + prove + verify runner for `circuits/`.
+- `examples/`: Noir example packages used by compatibility tests.
 - `test-vectors/`: Fixture artifacts + inputs used by tests.
 
 
-## Getting Started
+## Quickstart (Single Command)
 
 Prerequisites:
 
 ```bash
 cargo --version
+nargo --version
 node --version
 npm --version
 ```
+
+1) Edit the default circuit and inputs:
+- `circuits/src/main.nr`
+- `circuits/inputs.json`
+
+2) Run the full pipeline from repo root:
+
+```bash
+./scripts/run_circuit.sh
+```
+
+This performs:
+- `nargo compile` for `circuits/`
+- `noir-cli interop` to emit `.r1cs`/`.wtns`
+- `snarkjs` witness check
+- Groth16 setup, proof generation, and verification
+
+Outputs are written to `target/groth16/`:
+- `target/groth16/interop/circuit.r1cs`
+- `target/groth16/interop/witness.wtns`
+- `target/groth16/proof/proof.json`
+- `target/groth16/proof/public.json`
+- `target/groth16/proof/verification_key.json`
+
+Optional overrides:
+
+```bash
+CIRCUIT_DIR=/path/to/circuit OUT_DIR=/path/to/output PTAU_POWER=14 ./scripts/run_circuit.sh
+```
+
+## Getting Started (CLI Directly)
 
 Build the CLI:
 
 ```bash
 cargo build -p noir-cli
-```
-
-Run from workspace root:
-
-```bash
-./target/debug/noir-cli <command> ...
-```
-
-Optional: install as a normal shell command:
-
-```bash
-cargo install --path crates/noir-cli --force
-noir-cli --help
-```
-
-You can also run without building manually:
-
-```bash
-cargo run -p noir-cli -- <command> ...
 ```
 
 
@@ -114,54 +129,7 @@ Outputs:
 - `out/interop/circuit.r1cs`
 - `out/interop/witness.wtns`
 
-
-## Example Process (Groth16 End-to-End)
-
-### 1) Build CLI
-
-```bash
-cd /mnt/c/code/Noir-Groth16
-cargo build -p noir-cli
-```
-
-### 2) Compile fixture to interop artifacts
-
-```bash
-./target/debug/noir-cli interop test-vectors/fixture_artifact.json \
-  test-vectors/fixture_inputs.json --out demo
-```
-
-Produces:
-- `demo/circuit.r1cs`
-- `demo/witness.wtns`
-
-### 3) Generate and verify proof with `snarkjs`
-
-```bash
-cd /mnt/c/code/Noir-Groth16/demo
-npx snarkjs wtns check circuit.r1cs witness.wtns
-npx snarkjs powersoftau new bn128 12 pot12_0000.ptau -v
-npx snarkjs powersoftau prepare phase2 pot12_0000.ptau pot12_final.ptau -v
-npx snarkjs groth16 setup circuit.r1cs pot12_final.ptau circuit_0000.zkey
-npx snarkjs zkey contribute circuit_0000.zkey circuit_final.zkey --name="demo" -v -e="demo entropy"
-npx snarkjs zkey export verificationkey circuit_final.zkey verification_key.json
-npx snarkjs groth16 prove circuit_final.zkey witness.wtns proof.json public.json
-npx snarkjs groth16 verify verification_key.json public.json proof.json
-```
-
-### Optional: compile bundled Noir demo package
-
-Source lives at `examples/demo/src/main.nr`.
-
-```bash
-cd /mnt/c/code/Noir-Groth16/examples/demo
-nargo compile
-cd /mnt/c/code/Noir-Groth16
-./target/debug/noir-cli interop examples/demo/target/demo.json \
-  examples/demo/inputs.json --out demo
-```
-
-### Optional: run full example suite
+## Optional: run full example suite
 
 ```bash
 ./examples/run_test_suite.sh

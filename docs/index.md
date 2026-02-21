@@ -22,7 +22,7 @@ Pipeline:
 
 ## Documentation map
 
-- [Quickstart](quickstart): build and run the CLI in a few commands.
+- [Quickstart](quickstart): edit `circuits/` and run one command for compile/prove/verify.
 - [CLI Reference](cli-reference): command-by-command interface and outputs.
 - [snarkjs Interop](snarkjs-interop): end-to-end proving and verification flow.
 - [Technical Reference](technical-reference): crate boundaries, invariants, and format notes.

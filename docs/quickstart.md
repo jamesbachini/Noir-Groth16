@@ -5,78 +5,52 @@ nav_order: 2
 
 # Quickstart
 
-This guide uses included fixtures so you can validate the full pipeline quickly.
+This project includes a starter Noir circuit in `circuits/` and a single script that compiles, proves, and verifies end-to-end.
 
 ## Prerequisites
 
 - Rust toolchain with `cargo`
-- Optional for proving flow: Node.js + `snarkjs`
+- Noir tooling with `nargo`
+- Node.js + npm (used via `npx snarkjs`)
 
-## 1) Build the CLI
+## 1) Edit the circuit and inputs
+
+Update these files:
+
+- `circuits/src/main.nr`
+- `circuits/inputs.json`
+
+The default starter circuit checks `x * x == y` with `y` public.
+
+## 2) Run the full Groth16 flow
+
+From repository root:
 
 ```bash
-cargo build -p noir-cli
+./scripts/run_circuit.sh
 ```
 
-You can run commands through Cargo (`cargo run -p noir-cli -- ...`) or call the built binary directly.
+The script runs:
 
-## 2) Parse an artifact
+1. `cargo build -p noir-cli`
+2. `nargo compile` for `circuits/`
+3. `noir-cli interop` to emit `.r1cs` and `.wtns`
+4. `snarkjs wtns check`
+5. Powers of Tau setup (reused on later runs)
+6. Groth16 setup, prove, and verify
 
-```bash
-cargo run -p noir-cli -- compile-r1cs \
-  --out demo/quickstart/compile \
-  test-vectors/fixture_artifact.json
-```
+## 3) Read outputs
 
-Output:
+Outputs are written to `target/groth16/`:
 
-- `demo/quickstart/compile/parsed.json`
+- `target/groth16/interop/circuit.r1cs`
+- `target/groth16/interop/witness.wtns`
+- `target/groth16/proof/proof.json`
+- `target/groth16/proof/public.json`
+- `target/groth16/proof/verification_key.json`
 
-## 3) Generate witnesses
-
-```bash
-cargo run -p noir-cli -- witness \
-  --out demo/quickstart/witness \
-  test-vectors/fixture_artifact.json \
-  test-vectors/fixture_inputs.json
-```
-
-Outputs:
-
-- `demo/quickstart/witness/witness_map.json`
-- `demo/quickstart/witness/witness.bin`
-- `demo/quickstart/witness/witness.wtns`
-
-## 4) Emit debug R1CS JSON
+## Optional overrides
 
 ```bash
-cargo run -p noir-cli -- r1cs-json \
-  --out demo/quickstart/r1cs.json \
-  test-vectors/fixture_artifact.json
-```
-
-Output:
-
-- `demo/quickstart/r1cs.json` (JSON file)
-
-## 5) Emit interop artifacts (`.r1cs` + `.wtns`)
-
-```bash
-cargo run -p noir-cli -- interop \
-  --out demo/quickstart/interop \
-  test-vectors/fixture_artifact.json \
-  test-vectors/fixture_inputs.json
-```
-
-Outputs:
-
-- `demo/quickstart/interop/circuit.r1cs`
-- `demo/quickstart/interop/witness.wtns`
-
-## 6) Validate locally
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace
+CIRCUIT_DIR=/path/to/circuit OUT_DIR=/path/to/output PTAU_POWER=14 ./scripts/run_circuit.sh
 ```
