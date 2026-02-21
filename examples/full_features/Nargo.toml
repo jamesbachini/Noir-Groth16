@@ -1,0 +1,7 @@
+[package]
+name = "full_features"
+type = "bin"
+authors = ["James Bachini"]
+compiler_version = ">=0.30.0"
+
+[dependencies]
