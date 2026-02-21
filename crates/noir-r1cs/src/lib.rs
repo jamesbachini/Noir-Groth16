@@ -275,6 +275,47 @@ const SHA256_ROUND_CONSTANTS: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+const BLAKE2S_IV: [u32; 8] = [
+    0x6A09_E667,
+    0xBB67_AE85,
+    0x3C6E_F372,
+    0xA54F_F53A,
+    0x510E_527F,
+    0x9B05_688C,
+    0x1F83_D9AB,
+    0x5BE0_CD19,
+];
+
+const BLAKE2S_SIGMA: [[usize; 16]; 10] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+];
+
+const BLAKE3_MSG_SCHEDULE: [[usize; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+const BLAKE3_BLOCK_LEN: usize = 64;
+const BLAKE3_CHUNK_LEN: usize = 1024;
+const BLAKE3_CHUNK_START: u32 = 1 << 0;
+const BLAKE3_CHUNK_END: u32 = 1 << 1;
+const BLAKE3_PARENT: u32 = 1 << 2;
+const BLAKE3_ROOT: u32 = 1 << 3;
+
 impl<'a> LoweringContext<'a> {
     fn new_for_program(
         program: &'a AcirProgram,
@@ -1530,75 +1571,87 @@ impl<'a> LoweringContext<'a> {
             self.lower_range(input, 8, opcode_index)?;
         }
 
-        let mut bytes = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            match input {
-                FunctionInput::Constant(value) => {
-                    let Some(word) = value.try_to_u32() else {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake2s constant input must fit into 8 bits, found {value}"),
-                        );
-                    };
-                    if word > u32::from(u8::MAX) {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake2s constant input must fit into 8 bits, found {value}"),
-                        );
+        let can_specialize = inputs
+            .iter()
+            .all(|input| matches!(input, FunctionInput::Constant(_)))
+            || self.instance_witness.is_some();
+
+        if can_specialize {
+            let mut bytes = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                match input {
+                    FunctionInput::Constant(value) => {
+                        let Some(word) = value.try_to_u32() else {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!(
+                                    "Blake2s constant input must fit into 8 bits, found {value}"
+                                ),
+                            );
+                        };
+                        if word > u32::from(u8::MAX) {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!(
+                                    "Blake2s constant input must fit into 8 bits, found {value}"
+                                ),
+                            );
+                        }
+                        bytes.push(word as u8);
                     }
-                    bytes.push(word as u8);
-                }
-                FunctionInput::Witness(witness) => {
-                    if self.instance_witness.is_none() {
-                        return self.lower_blackbox_with_mode(
-                            call,
-                            opcode_index,
-                            "Blake2s witness-driven native lowering is not implemented".to_string(),
-                        );
+                    FunctionInput::Witness(witness) => {
+                        let value = self.constrain_witness_to_instance_value(
+                            *witness,
+                            "BlackBoxFuncCall::Blake2s input",
+                        )?;
+                        let Some(word) = value.try_to_u32() else {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!(
+                                    "Blake2s witness input must fit into 8 bits, found {value}"
+                                ),
+                            );
+                        };
+                        if word > u32::from(u8::MAX) {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!(
+                                    "Blake2s witness input must fit into 8 bits, found {value}"
+                                ),
+                            );
+                        }
+                        bytes.push(word as u8);
                     }
-                    let value = self.constrain_witness_to_instance_value(
-                        *witness,
-                        "BlackBoxFuncCall::Blake2s input",
-                    )?;
-                    let Some(word) = value.try_to_u32() else {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake2s witness input must fit into 8 bits, found {value}"),
-                        );
-                    };
-                    if word > u32::from(u8::MAX) {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake2s witness input must fit into 8 bits, found {value}"),
-                        );
-                    }
-                    bytes.push(word as u8);
                 }
             }
-        }
 
-        let digest = match blake2s(&bytes) {
-            Ok(digest) => digest,
-            Err(err) => {
-                return self.unsupported_opcode(
-                    "BlackBoxFuncCall",
-                    opcode_index,
-                    format!("failed evaluating constant Blake2s inputs: {err}"),
-                );
+            let digest = match blake2s(&bytes) {
+                Ok(digest) => digest,
+                Err(err) => {
+                    return self.unsupported_opcode(
+                        "BlackBoxFuncCall",
+                        opcode_index,
+                        format!("failed evaluating constant Blake2s inputs: {err}"),
+                    );
+                }
+            };
+
+            for (output, byte) in outputs.iter().zip(digest.into_iter()) {
+                self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake2s output")?;
+                let output_wire = self.wire_for_witness(*output)?;
+                self.enforce_wire_equals_constant(
+                    output_wire,
+                    FieldElement::from(u128::from(byte)),
+                )?;
             }
-        };
-
-        for (output, byte) in outputs.iter().zip(digest.into_iter()) {
-            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake2s output")?;
-            let output_wire = self.wire_for_witness(*output)?;
-            self.enforce_wire_equals_constant(output_wire, FieldElement::from(u128::from(byte)))?;
+            return Ok(());
         }
 
-        Ok(())
+        self.lower_blake2s_relation(inputs, outputs, opcode_index)
     }
 
     fn lower_blake3_with_constant_folding(
@@ -1615,75 +1668,83 @@ impl<'a> LoweringContext<'a> {
             self.lower_range(input, 8, opcode_index)?;
         }
 
-        let mut bytes = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            match input {
-                FunctionInput::Constant(value) => {
-                    let Some(word) = value.try_to_u32() else {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake3 constant input must fit into 8 bits, found {value}"),
-                        );
-                    };
-                    if word > u32::from(u8::MAX) {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake3 constant input must fit into 8 bits, found {value}"),
-                        );
+        let can_specialize = inputs
+            .iter()
+            .all(|input| matches!(input, FunctionInput::Constant(_)))
+            || self.instance_witness.is_some();
+
+        if can_specialize {
+            let mut bytes = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                match input {
+                    FunctionInput::Constant(value) => {
+                        let Some(word) = value.try_to_u32() else {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!(
+                                    "Blake3 constant input must fit into 8 bits, found {value}"
+                                ),
+                            );
+                        };
+                        if word > u32::from(u8::MAX) {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!(
+                                    "Blake3 constant input must fit into 8 bits, found {value}"
+                                ),
+                            );
+                        }
+                        bytes.push(word as u8);
                     }
-                    bytes.push(word as u8);
-                }
-                FunctionInput::Witness(witness) => {
-                    if self.instance_witness.is_none() {
-                        return self.lower_blackbox_with_mode(
-                            call,
-                            opcode_index,
-                            "Blake3 witness-driven native lowering is not implemented".to_string(),
-                        );
+                    FunctionInput::Witness(witness) => {
+                        let value = self.constrain_witness_to_instance_value(
+                            *witness,
+                            "BlackBoxFuncCall::Blake3 input",
+                        )?;
+                        let Some(word) = value.try_to_u32() else {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!("Blake3 witness input must fit into 8 bits, found {value}"),
+                            );
+                        };
+                        if word > u32::from(u8::MAX) {
+                            return self.unsupported_opcode(
+                                "BlackBoxFuncCall",
+                                opcode_index,
+                                format!("Blake3 witness input must fit into 8 bits, found {value}"),
+                            );
+                        }
+                        bytes.push(word as u8);
                     }
-                    let value = self.constrain_witness_to_instance_value(
-                        *witness,
-                        "BlackBoxFuncCall::Blake3 input",
-                    )?;
-                    let Some(word) = value.try_to_u32() else {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake3 witness input must fit into 8 bits, found {value}"),
-                        );
-                    };
-                    if word > u32::from(u8::MAX) {
-                        return self.unsupported_opcode(
-                            "BlackBoxFuncCall",
-                            opcode_index,
-                            format!("Blake3 witness input must fit into 8 bits, found {value}"),
-                        );
-                    }
-                    bytes.push(word as u8);
                 }
             }
-        }
 
-        let digest = match blake3(&bytes) {
-            Ok(digest) => digest,
-            Err(err) => {
-                return self.unsupported_opcode(
-                    "BlackBoxFuncCall",
-                    opcode_index,
-                    format!("failed evaluating constant Blake3 inputs: {err}"),
-                );
+            let digest = match blake3(&bytes) {
+                Ok(digest) => digest,
+                Err(err) => {
+                    return self.unsupported_opcode(
+                        "BlackBoxFuncCall",
+                        opcode_index,
+                        format!("failed evaluating constant Blake3 inputs: {err}"),
+                    );
+                }
+            };
+
+            for (output, byte) in outputs.iter().zip(digest.into_iter()) {
+                self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake3 output")?;
+                let output_wire = self.wire_for_witness(*output)?;
+                self.enforce_wire_equals_constant(
+                    output_wire,
+                    FieldElement::from(u128::from(byte)),
+                )?;
             }
-        };
-
-        for (output, byte) in outputs.iter().zip(digest.into_iter()) {
-            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake3 output")?;
-            let output_wire = self.wire_for_witness(*output)?;
-            self.enforce_wire_equals_constant(output_wire, FieldElement::from(u128::from(byte)))?;
+            return Ok(());
         }
 
-        Ok(())
+        self.lower_blake3_relation(inputs, outputs, opcode_index)
     }
 
     fn lower_sha256_compression_with_constant_folding(
@@ -2068,6 +2129,687 @@ impl<'a> LoweringContext<'a> {
             out.push(self.boolean_not_wire(*bit)?);
         }
         Ok(out)
+    }
+
+    fn lower_blake2s_relation(
+        &mut self,
+        inputs: &[AcirFunctionInput],
+        outputs: &[Witness; 32],
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let mut input_byte_bits = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Blake2s input[{index}]");
+            let bits = self.decompose_function_input_to_bits(input, 8, opcode_index, &context)?;
+            let bits_len = bits.len();
+            let byte_bits: [u32; 8] =
+                bits.try_into()
+                    .map_err(|_| R1csError::InvalidProgramInvariant {
+                        details: format!(
+                            "expected 8 bits for Blake2s byte input, found {bits_len}"
+                        ),
+                    })?;
+            input_byte_bits.push(byte_bits);
+        }
+
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+        let zero_byte_bits = [zero_wire; 8];
+
+        let mut chaining_value = Vec::with_capacity(8);
+        for (index, iv) in BLAKE2S_IV.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Blake2s init iv[{index}]");
+            chaining_value.push(self.blake2s_word_from_u32_constant(
+                *iv,
+                opcode_index,
+                &context,
+            )?);
+        }
+        chaining_value[0] =
+            self.blake2s_xor_word_with_u32_constant(&chaining_value[0], 0x0101_0020)?;
+
+        let input_len = inputs.len();
+        let n_blocks = if input_len == 0 {
+            1
+        } else {
+            input_len.div_ceil(64)
+        };
+        let mut total_bytes = 0u64;
+        for block_index in 0..n_blocks {
+            let block_start = block_index * 64;
+            let remaining = input_len.saturating_sub(block_start);
+            let block_len = if input_len == 0 { 0 } else { remaining.min(64) };
+            total_bytes = total_bytes.saturating_add(block_len as u64);
+            let is_last = block_index + 1 == n_blocks;
+
+            let mut message_words = Vec::with_capacity(16);
+            for word_index in 0..16 {
+                let mut word_bits = Vec::with_capacity(32);
+                for byte_offset in 0..4 {
+                    let byte_index = block_start + word_index * 4 + byte_offset;
+                    let byte_bits = if byte_index < input_len {
+                        input_byte_bits[byte_index]
+                    } else {
+                        zero_byte_bits
+                    };
+                    word_bits.extend_from_slice(&byte_bits);
+                }
+                message_words.push(self.sha256_word_from_bits(word_bits)?);
+            }
+
+            chaining_value = self.blake2s_compress_relation(
+                &chaining_value,
+                &message_words,
+                total_bytes as u32,
+                (total_bytes >> 32) as u32,
+                is_last,
+                opcode_index,
+            )?;
+        }
+
+        for (byte_index, output) in outputs.iter().enumerate() {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake2s output")?;
+            let output_wire = self.wire_for_witness(*output)?;
+            let context = format!("BlackBoxFuncCall::Blake2s output[{byte_index}]");
+            let output_bits =
+                self.decompose_wire_to_bits(output_wire, 8, opcode_index, &context)?;
+            let word_index = byte_index / 4;
+            let byte_offset = byte_index % 4;
+            let expected_bits =
+                &chaining_value[word_index].bits[(byte_offset * 8)..(byte_offset * 8 + 8)];
+            for (actual_bit, expected_bit) in output_bits.iter().zip(expected_bits.iter()) {
+                self.enforce_wire_equality(*actual_bit, *expected_bit)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn blake2s_word_from_u32_constant(
+        &mut self,
+        value: u32,
+        opcode_index: usize,
+        context: &str,
+    ) -> Result<Sha256Word, R1csError> {
+        let wire = self
+            .constrain_linear_combination_to_new_wire(&[], FieldElement::from(u128::from(value)))?;
+        let bits = self.decompose_wire_to_bits(wire, 32, opcode_index, context)?;
+        Ok(Sha256Word { wire, bits })
+    }
+
+    fn blake2s_xor_words(
+        &mut self,
+        lhs: &Sha256Word,
+        rhs: &Sha256Word,
+    ) -> Result<Sha256Word, R1csError> {
+        let bits = self.sha256_xor_bits(&lhs.bits, &rhs.bits)?;
+        self.sha256_word_from_bits(bits)
+    }
+
+    fn blake2s_xor_word_with_u32_constant(
+        &mut self,
+        word: &Sha256Word,
+        constant: u32,
+    ) -> Result<Sha256Word, R1csError> {
+        let mut bits = Vec::with_capacity(32);
+        for (bit_index, bit_wire) in word.bits.iter().enumerate() {
+            if ((constant >> bit_index) & 1) == 1 {
+                bits.push(self.boolean_not_wire(*bit_wire)?);
+            } else {
+                bits.push(*bit_wire);
+            }
+        }
+        self.sha256_word_from_bits(bits)
+    }
+
+    fn blake2s_rotate_right(
+        &mut self,
+        word: &Sha256Word,
+        amount: usize,
+    ) -> Result<Sha256Word, R1csError> {
+        self.sha256_word_from_bits(Self::sha256_right_rotate_bits(&word.bits, amount))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blake2s_mix_g(
+        &mut self,
+        state: &mut [Sha256Word],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        x: &Sha256Word,
+        y: &Sha256Word,
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let mut va = state[a].clone();
+        let mut vb = state[b].clone();
+        let mut vc = state[c].clone();
+        let mut vd = state[d].clone();
+
+        va = self.sha256_add_mod_u32(
+            &[va.wire, vb.wire, x.wire],
+            0,
+            opcode_index,
+            "BlackBoxFuncCall::Blake2s G(a,b,x)",
+        )?;
+        vd = self.blake2s_xor_words(&vd, &va)?;
+        vd = self.blake2s_rotate_right(&vd, 16)?;
+
+        vc = self.sha256_add_mod_u32(
+            &[vc.wire, vd.wire],
+            0,
+            opcode_index,
+            "BlackBoxFuncCall::Blake2s G(c,d)",
+        )?;
+        vb = self.blake2s_xor_words(&vb, &vc)?;
+        vb = self.blake2s_rotate_right(&vb, 12)?;
+
+        va = self.sha256_add_mod_u32(
+            &[va.wire, vb.wire, y.wire],
+            0,
+            opcode_index,
+            "BlackBoxFuncCall::Blake2s G(a,b,y)",
+        )?;
+        vd = self.blake2s_xor_words(&vd, &va)?;
+        vd = self.blake2s_rotate_right(&vd, 8)?;
+
+        vc = self.sha256_add_mod_u32(
+            &[vc.wire, vd.wire],
+            0,
+            opcode_index,
+            "BlackBoxFuncCall::Blake2s G(c,d)",
+        )?;
+        vb = self.blake2s_xor_words(&vb, &vc)?;
+        vb = self.blake2s_rotate_right(&vb, 7)?;
+
+        state[a] = va;
+        state[b] = vb;
+        state[c] = vc;
+        state[d] = vd;
+        Ok(())
+    }
+
+    fn blake2s_compress_relation(
+        &mut self,
+        chaining_value: &[Sha256Word],
+        message_words: &[Sha256Word],
+        t0: u32,
+        t1: u32,
+        is_last_block: bool,
+        opcode_index: usize,
+    ) -> Result<Vec<Sha256Word>, R1csError> {
+        if chaining_value.len() != 8 || message_words.len() != 16 {
+            return Err(R1csError::InvalidProgramInvariant {
+                details: format!(
+                    "invalid Blake2s compress arity: chaining={} message={}",
+                    chaining_value.len(),
+                    message_words.len()
+                ),
+            });
+        }
+
+        let mut iv_words = Vec::with_capacity(8);
+        for (index, iv) in BLAKE2S_IV.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Blake2s iv[{index}]");
+            iv_words.push(self.blake2s_word_from_u32_constant(*iv, opcode_index, &context)?);
+        }
+
+        let mut state = Vec::with_capacity(16);
+        state.extend_from_slice(chaining_value);
+        state.extend(iv_words);
+
+        state[12] = self.blake2s_xor_word_with_u32_constant(&state[12], t0)?;
+        state[13] = self.blake2s_xor_word_with_u32_constant(&state[13], t1)?;
+        if is_last_block {
+            state[14] = self.blake2s_xor_word_with_u32_constant(&state[14], u32::MAX)?;
+        }
+
+        for sigma in BLAKE2S_SIGMA {
+            self.blake2s_mix_g(
+                &mut state,
+                0,
+                4,
+                8,
+                12,
+                &message_words[sigma[0]],
+                &message_words[sigma[1]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                1,
+                5,
+                9,
+                13,
+                &message_words[sigma[2]],
+                &message_words[sigma[3]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                2,
+                6,
+                10,
+                14,
+                &message_words[sigma[4]],
+                &message_words[sigma[5]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                3,
+                7,
+                11,
+                15,
+                &message_words[sigma[6]],
+                &message_words[sigma[7]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                0,
+                5,
+                10,
+                15,
+                &message_words[sigma[8]],
+                &message_words[sigma[9]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                1,
+                6,
+                11,
+                12,
+                &message_words[sigma[10]],
+                &message_words[sigma[11]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                2,
+                7,
+                8,
+                13,
+                &message_words[sigma[12]],
+                &message_words[sigma[13]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                3,
+                4,
+                9,
+                14,
+                &message_words[sigma[14]],
+                &message_words[sigma[15]],
+                opcode_index,
+            )?;
+        }
+
+        let mut output = Vec::with_capacity(8);
+        for index in 0..8 {
+            let h_xor_state = self.blake2s_xor_words(&chaining_value[index], &state[index])?;
+            output.push(self.blake2s_xor_words(&h_xor_state, &state[index + 8])?);
+        }
+        Ok(output)
+    }
+
+    fn lower_blake3_relation(
+        &mut self,
+        inputs: &[AcirFunctionInput],
+        outputs: &[Witness; 32],
+        opcode_index: usize,
+    ) -> Result<(), R1csError> {
+        let mut input_byte_bits = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Blake3 input[{index}]");
+            let bits = self.decompose_function_input_to_bits(input, 8, opcode_index, &context)?;
+            let bits_len = bits.len();
+            let byte_bits: [u32; 8] =
+                bits.try_into()
+                    .map_err(|_| R1csError::InvalidProgramInvariant {
+                        details: format!("expected 8 bits for Blake3 byte input, found {bits_len}"),
+                    })?;
+            input_byte_bits.push(byte_bits);
+        }
+
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+        let zero_byte_bits = [zero_wire; 8];
+
+        let mut iv_words = Vec::with_capacity(8);
+        for (index, iv) in BLAKE2S_IV.iter().enumerate() {
+            let context = format!("BlackBoxFuncCall::Blake3 iv[{index}]");
+            iv_words.push(self.blake2s_word_from_u32_constant(*iv, opcode_index, &context)?);
+        }
+
+        let input_len = inputs.len();
+        let n_chunks = if input_len == 0 {
+            1
+        } else {
+            input_len.div_ceil(BLAKE3_CHUNK_LEN)
+        };
+        let mut chunk_cvs = Vec::with_capacity(n_chunks);
+        let mut root_digest_words: Option<Vec<Sha256Word>> = None;
+
+        for chunk_index in 0..n_chunks {
+            let chunk_start = chunk_index * BLAKE3_CHUNK_LEN;
+            let remaining = input_len.saturating_sub(chunk_start);
+            let chunk_len = if input_len == 0 {
+                0
+            } else {
+                remaining.min(BLAKE3_CHUNK_LEN)
+            };
+            let chunk_end = chunk_start + chunk_len;
+            let n_blocks = if chunk_len == 0 {
+                1
+            } else {
+                chunk_len.div_ceil(BLAKE3_BLOCK_LEN)
+            };
+
+            let mut cv_words = iv_words.clone();
+            for block_index in 0..n_blocks {
+                let block_start = chunk_start + block_index * BLAKE3_BLOCK_LEN;
+                let remaining_in_chunk = chunk_len.saturating_sub(block_index * BLAKE3_BLOCK_LEN);
+                let block_len = if chunk_len == 0 {
+                    0
+                } else {
+                    remaining_in_chunk.min(BLAKE3_BLOCK_LEN)
+                };
+
+                let mut message_words = Vec::with_capacity(16);
+                for word_index in 0..16 {
+                    let mut word_bits = Vec::with_capacity(32);
+                    for byte_offset in 0..4 {
+                        let byte_index = block_start + word_index * 4 + byte_offset;
+                        let byte_bits = if byte_index < chunk_end {
+                            input_byte_bits[byte_index]
+                        } else {
+                            zero_byte_bits
+                        };
+                        word_bits.extend_from_slice(&byte_bits);
+                    }
+                    message_words.push(self.sha256_word_from_bits(word_bits)?);
+                }
+
+                let mut flags = 0u32;
+                if block_index == 0 {
+                    flags |= BLAKE3_CHUNK_START;
+                }
+                let is_chunk_end_block = block_index + 1 == n_blocks;
+                if is_chunk_end_block {
+                    flags |= BLAKE3_CHUNK_END;
+                }
+
+                let counter = chunk_index as u64;
+                let counter_low = counter as u32;
+                let counter_high = (counter >> 32) as u32;
+
+                if is_chunk_end_block {
+                    if n_chunks == 1 {
+                        root_digest_words = Some(self.blake3_compress_to_cv_relation(
+                            &cv_words,
+                            &message_words,
+                            block_len as u32,
+                            counter_low,
+                            counter_high,
+                            flags | BLAKE3_ROOT,
+                            &iv_words,
+                            opcode_index,
+                        )?);
+                    } else {
+                        let chunk_cv = self.blake3_compress_to_cv_relation(
+                            &cv_words,
+                            &message_words,
+                            block_len as u32,
+                            counter_low,
+                            counter_high,
+                            flags,
+                            &iv_words,
+                            opcode_index,
+                        )?;
+                        chunk_cvs.push(chunk_cv);
+                    }
+                } else {
+                    cv_words = self.blake3_compress_to_cv_relation(
+                        &cv_words,
+                        &message_words,
+                        BLAKE3_BLOCK_LEN as u32,
+                        counter_low,
+                        counter_high,
+                        flags,
+                        &iv_words,
+                        opcode_index,
+                    )?;
+                }
+            }
+        }
+
+        let digest_words = if let Some(root_words) = root_digest_words {
+            root_words
+        } else {
+            while chunk_cvs.len() > 2 {
+                let mut next = Vec::with_capacity(chunk_cvs.len().div_ceil(2));
+                for pair_start in (0..chunk_cvs.len()).step_by(2) {
+                    if pair_start + 1 < chunk_cvs.len() {
+                        next.push(self.blake3_parent_cv_relation(
+                            &chunk_cvs[pair_start],
+                            &chunk_cvs[pair_start + 1],
+                            &iv_words,
+                            opcode_index,
+                        )?);
+                    } else {
+                        next.push(chunk_cvs[pair_start].clone());
+                    }
+                }
+                chunk_cvs = next;
+            }
+            if chunk_cvs.len() != 2 {
+                return Err(R1csError::InvalidProgramInvariant {
+                    details: format!("invalid Blake3 reduction width: {}", chunk_cvs.len()),
+                });
+            }
+
+            let mut root_block = Vec::with_capacity(16);
+            root_block.extend_from_slice(&chunk_cvs[0]);
+            root_block.extend_from_slice(&chunk_cvs[1]);
+            self.blake3_compress_to_cv_relation(
+                &iv_words,
+                &root_block,
+                BLAKE3_BLOCK_LEN as u32,
+                0,
+                0,
+                BLAKE3_PARENT | BLAKE3_ROOT,
+                &iv_words,
+                opcode_index,
+            )?
+        };
+
+        for (byte_index, output) in outputs.iter().enumerate() {
+            self.ensure_witness_in_range(*output, "BlackBoxFuncCall::Blake3 output")?;
+            let output_wire = self.wire_for_witness(*output)?;
+            let context = format!("BlackBoxFuncCall::Blake3 output[{byte_index}]");
+            let output_bits =
+                self.decompose_wire_to_bits(output_wire, 8, opcode_index, &context)?;
+            let word_index = byte_index / 4;
+            let byte_offset = byte_index % 4;
+            let expected_bits =
+                &digest_words[word_index].bits[(byte_offset * 8)..(byte_offset * 8 + 8)];
+            for (actual_bit, expected_bit) in output_bits.iter().zip(expected_bits.iter()) {
+                self.enforce_wire_equality(*actual_bit, *expected_bit)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn blake3_parent_cv_relation(
+        &mut self,
+        left_cv: &[Sha256Word],
+        right_cv: &[Sha256Word],
+        iv_words: &[Sha256Word],
+        opcode_index: usize,
+    ) -> Result<Vec<Sha256Word>, R1csError> {
+        if left_cv.len() != 8 || right_cv.len() != 8 {
+            return Err(R1csError::InvalidProgramInvariant {
+                details: format!(
+                    "invalid Blake3 parent arity: left={} right={}",
+                    left_cv.len(),
+                    right_cv.len()
+                ),
+            });
+        }
+
+        let mut message_words = Vec::with_capacity(16);
+        message_words.extend_from_slice(left_cv);
+        message_words.extend_from_slice(right_cv);
+        self.blake3_compress_to_cv_relation(
+            iv_words,
+            &message_words,
+            BLAKE3_BLOCK_LEN as u32,
+            0,
+            0,
+            BLAKE3_PARENT,
+            iv_words,
+            opcode_index,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn blake3_compress_to_cv_relation(
+        &mut self,
+        chaining_value: &[Sha256Word],
+        message_words: &[Sha256Word],
+        block_len: u32,
+        counter_low: u32,
+        counter_high: u32,
+        flags: u32,
+        iv_words: &[Sha256Word],
+        opcode_index: usize,
+    ) -> Result<Vec<Sha256Word>, R1csError> {
+        if chaining_value.len() != 8 || message_words.len() != 16 || iv_words.len() != 8 {
+            return Err(R1csError::InvalidProgramInvariant {
+                details: format!(
+                    "invalid Blake3 compress arity: chaining={} message={} iv={}",
+                    chaining_value.len(),
+                    message_words.len(),
+                    iv_words.len()
+                ),
+            });
+        }
+
+        let mut state = Vec::with_capacity(16);
+        state.extend_from_slice(chaining_value);
+        state.extend_from_slice(&iv_words[..4]);
+        state.push(self.blake2s_word_from_u32_constant(
+            counter_low,
+            opcode_index,
+            "BlackBoxFuncCall::Blake3 counter low",
+        )?);
+        state.push(self.blake2s_word_from_u32_constant(
+            counter_high,
+            opcode_index,
+            "BlackBoxFuncCall::Blake3 counter high",
+        )?);
+        state.push(self.blake2s_word_from_u32_constant(
+            block_len,
+            opcode_index,
+            "BlackBoxFuncCall::Blake3 block len",
+        )?);
+        state.push(self.blake2s_word_from_u32_constant(
+            flags,
+            opcode_index,
+            "BlackBoxFuncCall::Blake3 flags",
+        )?);
+
+        for schedule in BLAKE3_MSG_SCHEDULE {
+            self.blake2s_mix_g(
+                &mut state,
+                0,
+                4,
+                8,
+                12,
+                &message_words[schedule[0]],
+                &message_words[schedule[1]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                1,
+                5,
+                9,
+                13,
+                &message_words[schedule[2]],
+                &message_words[schedule[3]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                2,
+                6,
+                10,
+                14,
+                &message_words[schedule[4]],
+                &message_words[schedule[5]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                3,
+                7,
+                11,
+                15,
+                &message_words[schedule[6]],
+                &message_words[schedule[7]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                0,
+                5,
+                10,
+                15,
+                &message_words[schedule[8]],
+                &message_words[schedule[9]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                1,
+                6,
+                11,
+                12,
+                &message_words[schedule[10]],
+                &message_words[schedule[11]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                2,
+                7,
+                8,
+                13,
+                &message_words[schedule[12]],
+                &message_words[schedule[13]],
+                opcode_index,
+            )?;
+            self.blake2s_mix_g(
+                &mut state,
+                3,
+                4,
+                9,
+                14,
+                &message_words[schedule[14]],
+                &message_words[schedule[15]],
+                opcode_index,
+            )?;
+        }
+
+        let mut output = Vec::with_capacity(8);
+        for index in 0..8 {
+            output.push(self.blake2s_xor_words(&state[index], &state[index + 8])?);
+        }
+        Ok(output)
     }
 
     fn lower_ecdsa_with_constant_folding(
@@ -2542,89 +3284,501 @@ impl<'a> LoweringContext<'a> {
             )?;
         }
 
-        let mut point_values = Vec::with_capacity(points.len());
-        for point in points {
-            match point {
-                FunctionInput::Constant(value) => point_values.push(*value),
-                FunctionInput::Witness(witness) => {
-                    if self.instance_witness.is_none() {
-                        return self.lower_blackbox_with_mode(
-                            call,
-                            opcode_index,
-                            "MultiScalarMul witness-driven native lowering is not implemented"
-                                .to_string(),
-                        );
-                    }
-                    point_values.push(self.constrain_witness_to_instance_value(
-                        *witness,
-                        "BlackBoxFuncCall::MultiScalarMul point",
-                    )?);
+        let all_points_constant = points
+            .iter()
+            .all(|input| matches!(input, FunctionInput::Constant(_)));
+        let all_scalars_constant = scalars
+            .iter()
+            .all(|input| matches!(input, FunctionInput::Constant(_)));
+        if all_points_constant && all_scalars_constant {
+            let point_values: Vec<FieldElement> = points
+                .iter()
+                .map(|input| match input {
+                    FunctionInput::Constant(value) => *value,
+                    FunctionInput::Witness(_) => unreachable!("all points are constants"),
+                })
+                .collect();
+            let mut scalar_lo = Vec::with_capacity(scalars.len() / 2);
+            let mut scalar_hi = Vec::with_capacity(scalars.len() / 2);
+            for (index, scalar) in scalars.iter().enumerate() {
+                let value = match scalar {
+                    FunctionInput::Constant(value) => *value,
+                    FunctionInput::Witness(_) => unreachable!("all scalars are constants"),
+                };
+                if index.is_multiple_of(2) {
+                    scalar_lo.push(value);
+                } else {
+                    scalar_hi.push(value);
                 }
             }
-        }
 
-        let mut scalar_lo = Vec::with_capacity(scalars.len() / 2);
-        let mut scalar_hi = Vec::with_capacity(scalars.len() / 2);
-        for (index, scalar) in scalars.iter().enumerate() {
-            match scalar {
-                FunctionInput::Constant(value) => {
-                    if index.is_multiple_of(2) {
-                        scalar_lo.push(*value);
-                    } else {
-                        scalar_hi.push(*value);
-                    }
-                }
-                FunctionInput::Witness(witness) => {
-                    if self.instance_witness.is_none() {
-                        return self.lower_blackbox_with_mode(
-                            call,
+            let (result_x, result_y, result_infinite) =
+                match bn254_multi_scalar_mul(&point_values, &scalar_lo, &scalar_hi) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
                             opcode_index,
-                            "MultiScalarMul witness-driven native lowering is not implemented"
-                                .to_string(),
+                            format!("failed evaluating constant MultiScalarMul inputs: {err}"),
                         );
                     }
-                    let value = self.constrain_witness_to_instance_value(
-                        *witness,
-                        "BlackBoxFuncCall::MultiScalarMul scalar",
-                    )?;
-                    if index.is_multiple_of(2) {
-                        scalar_lo.push(value);
-                    } else {
-                        scalar_hi.push(value);
-                    }
-                }
-            }
+                };
+
+            self.enforce_selector_times_linear_zero(
+                predicate_wire,
+                &[(output_x_wire, FieldElement::one())],
+                -result_x,
+            )?;
+            self.enforce_selector_times_linear_zero(
+                predicate_wire,
+                &[(output_y_wire, FieldElement::one())],
+                -result_y,
+            )?;
+            self.enforce_selector_times_linear_zero(
+                predicate_wire,
+                &[(output_infinite_wire, FieldElement::one())],
+                -result_infinite,
+            )?;
+            return Ok(());
         }
 
-        let (result_x, result_y, result_infinite) =
-            match bn254_multi_scalar_mul(&point_values, &scalar_lo, &scalar_hi) {
-                Ok(result) => result,
-                Err(err) => {
-                    return self.unsupported_opcode(
-                        "BlackBoxFuncCall",
-                        opcode_index,
-                        format!("failed evaluating constant MultiScalarMul inputs: {err}"),
-                    );
-                }
-            };
+        let mut point_wires = Vec::with_capacity(points.len() / 3);
+        for point_chunk in points.chunks_exact(3) {
+            let point_x = self.resolve_blackbox_function_input_wire(
+                point_chunk.first().expect("point x is present"),
+                "BlackBoxFuncCall::MultiScalarMul point.x",
+            )?;
+            let point_y = self.resolve_blackbox_function_input_wire(
+                point_chunk.get(1).expect("point y is present"),
+                "BlackBoxFuncCall::MultiScalarMul point.y",
+            )?;
+            let point_infinite = self.resolve_blackbox_function_input_wire(
+                point_chunk.get(2).expect("point infinite flag is present"),
+                "BlackBoxFuncCall::MultiScalarMul point.is_infinite",
+            )?;
+            self.enforce_boolean_wire(point_infinite)?;
+
+            let finite_selector = self.boolean_not_wire(point_infinite)?;
+            let point_y_squared = self.multiply_wires(point_y, point_y)?;
+            let point_x_squared = self.multiply_wires(point_x, point_x)?;
+            let point_x_cubed = self.multiply_wires(point_x_squared, point_x)?;
+            self.enforce_selector_times_linear_zero(
+                finite_selector,
+                &[
+                    (point_y_squared, FieldElement::one()),
+                    (point_x_cubed, -FieldElement::one()),
+                ],
+                FieldElement::from(17u128),
+            )?;
+
+            point_wires.push([point_x, point_y, point_infinite]);
+        }
+
+        let modulus_bits_le = Self::grumpkin_scalar_modulus_bits_le();
+        let mut scalar_bits = Vec::with_capacity(scalars.len() / 2);
+        for point_index in 0..(scalars.len() / 2) {
+            let scalar_lo = self.resolve_blackbox_function_input_wire(
+                scalars
+                    .get(point_index * 2)
+                    .expect("scalar low limb is present"),
+                "BlackBoxFuncCall::MultiScalarMul scalar.lo",
+            )?;
+            let scalar_hi = self.resolve_blackbox_function_input_wire(
+                scalars
+                    .get(point_index * 2 + 1)
+                    .expect("scalar high limb is present"),
+                "BlackBoxFuncCall::MultiScalarMul scalar.hi",
+            )?;
+            let mut point_scalar_bits = self.decompose_wire_to_bits(
+                scalar_lo,
+                128,
+                opcode_index,
+                "BlackBoxFuncCall::MultiScalarMul scalar.lo",
+            )?;
+            point_scalar_bits.extend(self.decompose_wire_to_bits(
+                scalar_hi,
+                128,
+                opcode_index,
+                "BlackBoxFuncCall::MultiScalarMul scalar.hi",
+            )?);
+
+            let scalar_is_valid =
+                self.less_than_constant_bits_le(&point_scalar_bits, &modulus_bits_le)?;
+            self.enforce_wire_equals_constant(scalar_is_valid, FieldElement::one())
+                .map_err(|err| match err {
+                    R1csError::InvalidProgramInvariant { details } => {
+                        R1csError::InvalidProgramInvariant {
+                            details: format!(
+                                "failed constraining MultiScalarMul scalar[{point_index}] < modulus: {details}"
+                            ),
+                        }
+                    }
+                    other => other,
+                })?;
+
+            scalar_bits.push(point_scalar_bits);
+        }
+
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+        let mut accumulated = [zero_wire, zero_wire, 0];
+
+        for (point, point_scalar_bits) in point_wires.iter().zip(scalar_bits.iter()) {
+            let mut point_accumulated = [zero_wire, zero_wire, 0];
+            let mut running = *point;
+
+            for scalar_bit in point_scalar_bits {
+                let add_result =
+                    self.add_embedded_curve_points_complete(point_accumulated, running)?;
+                point_accumulated =
+                    self.select_curve_point(*scalar_bit, add_result, point_accumulated)?;
+                running = self.add_embedded_curve_points_complete(running, running)?;
+            }
+
+            accumulated =
+                self.add_embedded_curve_points_complete(accumulated, point_accumulated)?;
+        }
 
         self.enforce_selector_times_linear_zero(
             predicate_wire,
-            &[(output_x_wire, FieldElement::one())],
-            -result_x,
+            &[
+                (output_x_wire, FieldElement::one()),
+                (accumulated[0], -FieldElement::one()),
+            ],
+            FieldElement::zero(),
         )?;
         self.enforce_selector_times_linear_zero(
             predicate_wire,
-            &[(output_y_wire, FieldElement::one())],
-            -result_y,
+            &[
+                (output_y_wire, FieldElement::one()),
+                (accumulated[1], -FieldElement::one()),
+            ],
+            FieldElement::zero(),
         )?;
         self.enforce_selector_times_linear_zero(
             predicate_wire,
-            &[(output_infinite_wire, FieldElement::one())],
-            -result_infinite,
+            &[
+                (output_infinite_wire, FieldElement::one()),
+                (accumulated[2], -FieldElement::one()),
+            ],
+            FieldElement::zero(),
         )?;
 
         Ok(())
+    }
+
+    fn add_embedded_curve_points_complete(
+        &mut self,
+        input1: [u32; 3],
+        input2: [u32; 3],
+    ) -> Result<[u32; 3], R1csError> {
+        let input1_x = input1[0];
+        let input1_y = input1[1];
+        let input1_infinite = input1[2];
+        let input2_x = input2[0];
+        let input2_y = input2[1];
+        let input2_infinite = input2[2];
+
+        self.enforce_boolean_wire(input1_infinite)?;
+        self.enforce_boolean_wire(input2_infinite)?;
+
+        let input1_finite = self.boolean_not_wire(input1_infinite)?;
+        let input2_finite = self.boolean_not_wire(input2_infinite)?;
+        let both_finite = self.boolean_and_wires(input1_finite, input2_finite)?;
+        let input1_inf_input2_finite = self.boolean_and_wires(input1_infinite, input2_finite)?;
+        let input1_finite_input2_inf = self.boolean_and_wires(input1_finite, input2_infinite)?;
+        let both_infinite = self.boolean_and_wires(input1_infinite, input2_infinite)?;
+
+        self.enforce_selector_times_linear_zero(
+            0,
+            &[
+                (both_finite, FieldElement::one()),
+                (input1_inf_input2_finite, FieldElement::one()),
+                (input1_finite_input2_inf, FieldElement::one()),
+                (both_infinite, FieldElement::one()),
+            ],
+            -FieldElement::one(),
+        )?;
+
+        let input1_y_squared = self.multiply_wires(input1_y, input1_y)?;
+        let input1_x_squared = self.multiply_wires(input1_x, input1_x)?;
+        let input1_x_cubed = self.multiply_wires(input1_x_squared, input1_x)?;
+        self.enforce_selector_times_linear_zero(
+            input1_finite,
+            &[
+                (input1_y_squared, FieldElement::one()),
+                (input1_x_cubed, -FieldElement::one()),
+            ],
+            FieldElement::from(17u128),
+        )?;
+
+        let input2_y_squared = self.multiply_wires(input2_y, input2_y)?;
+        let input2_x_squared = self.multiply_wires(input2_x, input2_x)?;
+        let input2_x_cubed = self.multiply_wires(input2_x_squared, input2_x)?;
+        self.enforce_selector_times_linear_zero(
+            input2_finite,
+            &[
+                (input2_y_squared, FieldElement::one()),
+                (input2_x_cubed, -FieldElement::one()),
+            ],
+            FieldElement::from(17u128),
+        )?;
+
+        let same_x = self.equality_indicator_wire(input1_x, input2_x)?;
+        let same_y = self.equality_indicator_wire(input1_y, input2_y)?;
+        let y_sum = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input1_y, FieldElement::one()),
+                (input2_y, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+        let opposite_y = self.equality_indicator_wire(y_sum, zero_wire)?;
+
+        let finite_output_infinite = self.boolean_and_wires(same_x, opposite_y)?;
+        let one_minus_finite_output_infinite = self.boolean_not_wire(finite_output_infinite)?;
+        let finite_selector =
+            self.boolean_and_wires(both_finite, one_minus_finite_output_infinite)?;
+        let finite_infinite_selector =
+            self.boolean_and_wires(both_finite, finite_output_infinite)?;
+
+        let is_double = self.boolean_and_wires(same_x, same_y)?;
+        let one_minus_is_double = self.boolean_not_wire(is_double)?;
+        let add_selector = self.boolean_and_wires(finite_selector, one_minus_is_double)?;
+        let double_selector = self.boolean_and_wires(finite_selector, is_double)?;
+
+        let finite_output_x = self.allocate_intermediate_wire();
+        let finite_output_y = self.allocate_intermediate_wire();
+
+        let x2_minus_x1 = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input2_x, FieldElement::one()),
+                (input1_x, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let add_denominator_inverse = self.allocate_intermediate_wire();
+        let add_denominator_inverse_check =
+            self.multiply_wires(x2_minus_x1, add_denominator_inverse)?;
+        self.enforce_selector_times_linear_zero(
+            add_selector,
+            &[(add_denominator_inverse_check, FieldElement::one())],
+            -FieldElement::one(),
+        )?;
+        let y2_minus_y1 = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input2_y, FieldElement::one()),
+                (input1_y, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let add_lambda = self.multiply_wires(y2_minus_y1, add_denominator_inverse)?;
+
+        let two_y1 = self.constrain_linear_combination_to_new_wire(
+            &[(input1_y, FieldElement::from(2u128))],
+            FieldElement::zero(),
+        )?;
+        let double_denominator_inverse = self.allocate_intermediate_wire();
+        let double_denominator_inverse_check =
+            self.multiply_wires(two_y1, double_denominator_inverse)?;
+        self.enforce_selector_times_linear_zero(
+            double_selector,
+            &[(double_denominator_inverse_check, FieldElement::one())],
+            -FieldElement::one(),
+        )?;
+        let three_x1_squared = self.constrain_linear_combination_to_new_wire(
+            &[(input1_x_squared, FieldElement::from(3u128))],
+            FieldElement::zero(),
+        )?;
+        let double_lambda = self.multiply_wires(three_x1_squared, double_denominator_inverse)?;
+
+        let add_lambda_squared = self.multiply_wires(add_lambda, add_lambda)?;
+        self.enforce_selector_times_linear_zero(
+            add_selector,
+            &[
+                (finite_output_x, FieldElement::one()),
+                (add_lambda_squared, -FieldElement::one()),
+                (input1_x, FieldElement::one()),
+                (input2_x, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let input1_x_minus_output_x = self.constrain_linear_combination_to_new_wire(
+            &[
+                (input1_x, FieldElement::one()),
+                (finite_output_x, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        let add_y_intermediate = self.multiply_wires(add_lambda, input1_x_minus_output_x)?;
+        self.enforce_selector_times_linear_zero(
+            add_selector,
+            &[
+                (finite_output_y, FieldElement::one()),
+                (add_y_intermediate, -FieldElement::one()),
+                (input1_y, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        let double_lambda_squared = self.multiply_wires(double_lambda, double_lambda)?;
+        self.enforce_selector_times_linear_zero(
+            double_selector,
+            &[
+                (finite_output_x, FieldElement::one()),
+                (double_lambda_squared, -FieldElement::one()),
+                (input1_x, FieldElement::from(2u128)),
+            ],
+            FieldElement::zero(),
+        )?;
+        let double_y_intermediate = self.multiply_wires(double_lambda, input1_x_minus_output_x)?;
+        self.enforce_selector_times_linear_zero(
+            double_selector,
+            &[
+                (finite_output_y, FieldElement::one()),
+                (double_y_intermediate, -FieldElement::one()),
+                (input1_y, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        self.enforce_selector_times_linear_zero(
+            finite_infinite_selector,
+            &[(finite_output_x, FieldElement::one())],
+            FieldElement::zero(),
+        )?;
+        self.enforce_selector_times_linear_zero(
+            finite_infinite_selector,
+            &[(finite_output_y, FieldElement::one())],
+            FieldElement::zero(),
+        )?;
+
+        let output_x_finite = self.multiply_wires(both_finite, finite_output_x)?;
+        let output_x_input2 = self.multiply_wires(input1_inf_input2_finite, input2_x)?;
+        let output_x_input1 = self.multiply_wires(input1_finite_input2_inf, input1_x)?;
+        let output_x = self.constrain_linear_combination_to_new_wire(
+            &[
+                (output_x_finite, FieldElement::one()),
+                (output_x_input2, FieldElement::one()),
+                (output_x_input1, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        let output_y_finite = self.multiply_wires(both_finite, finite_output_y)?;
+        let output_y_input2 = self.multiply_wires(input1_inf_input2_finite, input2_y)?;
+        let output_y_input1 = self.multiply_wires(input1_finite_input2_inf, input1_y)?;
+        let output_y = self.constrain_linear_combination_to_new_wire(
+            &[
+                (output_y_finite, FieldElement::one()),
+                (output_y_input2, FieldElement::one()),
+                (output_y_input1, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+
+        let output_infinite_finite = self.multiply_wires(both_finite, finite_output_infinite)?;
+        let output_infinite = self.constrain_linear_combination_to_new_wire(
+            &[
+                (output_infinite_finite, FieldElement::one()),
+                (both_infinite, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        self.enforce_boolean_wire(output_infinite)?;
+
+        Ok([output_x, output_y, output_infinite])
+    }
+
+    fn boolean_or_wires(&mut self, lhs_wire: u32, rhs_wire: u32) -> Result<u32, R1csError> {
+        let product_wire = self.multiply_wires(lhs_wire, rhs_wire)?;
+        let output_wire = self.constrain_linear_combination_to_new_wire(
+            &[
+                (lhs_wire, FieldElement::one()),
+                (rhs_wire, FieldElement::one()),
+                (product_wire, -FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )?;
+        self.enforce_boolean_wire(output_wire)?;
+        Ok(output_wire)
+    }
+
+    fn select_wire_with_selector(
+        &mut self,
+        selector_wire: u32,
+        when_true_wire: u32,
+        when_false_wire: u32,
+    ) -> Result<u32, R1csError> {
+        let selector_times_true = self.multiply_wires(selector_wire, when_true_wire)?;
+        let one_minus_selector = self.boolean_not_wire(selector_wire)?;
+        let one_minus_selector_times_false =
+            self.multiply_wires(one_minus_selector, when_false_wire)?;
+        self.constrain_linear_combination_to_new_wire(
+            &[
+                (selector_times_true, FieldElement::one()),
+                (one_minus_selector_times_false, FieldElement::one()),
+            ],
+            FieldElement::zero(),
+        )
+    }
+
+    fn select_curve_point(
+        &mut self,
+        selector_wire: u32,
+        when_true: [u32; 3],
+        when_false: [u32; 3],
+    ) -> Result<[u32; 3], R1csError> {
+        Ok([
+            self.select_wire_with_selector(selector_wire, when_true[0], when_false[0])?,
+            self.select_wire_with_selector(selector_wire, when_true[1], when_false[1])?,
+            self.select_wire_with_selector(selector_wire, when_true[2], when_false[2])?,
+        ])
+    }
+
+    fn less_than_constant_bits_le(
+        &mut self,
+        bits_le: &[u32],
+        constant_bits_le: &[bool],
+    ) -> Result<u32, R1csError> {
+        if bits_le.len() != constant_bits_le.len() {
+            return Err(R1csError::InvalidProgramInvariant {
+                details: format!(
+                    "bit-width mismatch in less_than_constant_bits_le: {} bits vs {} constants",
+                    bits_le.len(),
+                    constant_bits_le.len()
+                ),
+            });
+        }
+
+        let zero_wire = self.constrain_linear_combination_to_new_wire(&[], FieldElement::zero())?;
+        let mut is_less = zero_wire;
+        let mut equal_prefix = 0u32;
+
+        for index in (0..bits_le.len()).rev() {
+            let bit = bits_le[index];
+            if constant_bits_le[index] {
+                let not_bit = self.boolean_not_wire(bit)?;
+                let less_here = self.boolean_and_wires(equal_prefix, not_bit)?;
+                is_less = self.boolean_or_wires(is_less, less_here)?;
+                equal_prefix = self.boolean_and_wires(equal_prefix, bit)?;
+            } else {
+                let not_bit = self.boolean_not_wire(bit)?;
+                equal_prefix = self.boolean_and_wires(equal_prefix, not_bit)?;
+            }
+        }
+
+        Ok(is_less)
+    }
+
+    fn grumpkin_scalar_modulus_bits_le() -> Vec<bool> {
+        let mut bits = Vec::with_capacity(256);
+        for byte in bn254_modulus_le_bytes() {
+            for bit in 0..8 {
+                bits.push(((byte >> bit) & 1) == 1);
+            }
+        }
+        bits
     }
 
     fn lower_poseidon2_permutation(
@@ -5312,8 +6466,8 @@ mod tests {
             FieldElement::one(),
             FieldElement::zero(),
         ];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[9] = FieldElement::zero();
@@ -5372,8 +6526,8 @@ mod tests {
             FieldElement::zero(),
             FieldElement::one(),
         ];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[7] = FieldElement::one();
@@ -5473,8 +6627,8 @@ mod tests {
 
         let system = compile_r1cs(&program).expect("multi-scalar multiplication should lower");
         let witness = vec![FieldElement::one(), output_x, output_y, output_infinite];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[2] += FieldElement::one();
@@ -5519,8 +6673,8 @@ mod tests {
             FieldElement::one(),
             FieldElement::zero(),
         ];
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[3] = FieldElement::zero();
@@ -5591,7 +6745,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_scalar_mul_witness_inputs_require_native_relation_in_strict_mode() {
+    fn multi_scalar_mul_witness_inputs_lower_in_strict_mode() {
         let circuit = Circuit {
             current_witness_index: 7,
             opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::MultiScalarMul {
@@ -5620,14 +6774,14 @@ mod tests {
             functions: vec![circuit],
             unconstrained_functions: Vec::new(),
         };
-        let err = compile_r1cs(&program)
-            .expect_err("strict mode should reject witness-driven multi-scalar multiplication");
-        assert!(format!("{err}")
-            .contains("MultiScalarMul witness-driven native lowering is not implemented"));
+
+        let system = compile_r1cs(&program).expect("witness-driven MultiScalarMul should lower");
+        assert!(system.n_constraints > 0);
     }
 
     #[test]
-    fn multi_scalar_mul_witness_inputs_can_be_lowered_with_instance_witness_and_tamper_fails() {
+    #[ignore = "expensive witness-driven MSM relation"]
+    fn multi_scalar_mul_witness_inputs_are_natively_lowered_in_strict_mode() {
         let generator_x =
             field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
         let generator_y =
@@ -5679,10 +6833,10 @@ mod tests {
             output_y,
             output_infinite,
         ];
-        let system = compile_r1cs_with_witness(&program, &witness)
-            .expect("witness-specialized MultiScalarMul should lower in strict mode");
-        assert!(system.is_satisfied(&witness));
+        let system =
+            compile_r1cs(&program).expect("witness-driven MultiScalarMul should lower natively");
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered_input = witness.clone();
         tampered_input[2] += FieldElement::one();
@@ -5691,6 +6845,61 @@ mod tests {
         let mut tampered_output = witness.clone();
         tampered_output[7] += FieldElement::one();
         assert!(!system.is_satisfied(&tampered_output));
+    }
+
+    #[test]
+    #[ignore = "expensive witness-driven MSM relation"]
+    fn multi_scalar_mul_rejects_scalar_equal_to_modulus() {
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+        let scalar_lo = field_from_hex("97816a916871ca8d3c208c16d87cfd47");
+        let scalar_hi = field_from_hex("30644e72e131a029b85045b68181585d");
+
+        let circuit = Circuit {
+            current_witness_index: 7,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::MultiScalarMul {
+                points: vec![
+                    FunctionInput::Witness(Witness(0)),
+                    FunctionInput::Witness(Witness(1)),
+                    FunctionInput::Witness(Witness(2)),
+                ],
+                scalars: vec![
+                    FunctionInput::Witness(Witness(3)),
+                    FunctionInput::Witness(Witness(4)),
+                ],
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                outputs: (Witness(5), Witness(6), Witness(7)),
+            })],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system =
+            compile_r1cs(&program).expect("MSM relation should lower before witness validation");
+
+        let witness = vec![
+            FieldElement::one(),
+            generator_x,
+            generator_y,
+            FieldElement::zero(),
+            scalar_lo,
+            scalar_hi,
+            FieldElement::zero(),
+            FieldElement::zero(),
+            FieldElement::one(),
+        ];
+        assert!(!system.is_satisfied(&witness));
     }
 
     #[test]
@@ -5929,8 +7138,8 @@ mod tests {
                 .into_iter()
                 .map(|byte| FieldElement::from(u128::from(byte))),
         );
-        assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
+        assert!(system.is_satisfied(&witness));
 
         let mut tampered = witness.clone();
         tampered[10] += FieldElement::one();
@@ -5974,7 +7183,7 @@ mod tests {
     }
 
     #[test]
-    fn blake2s_witness_inputs_require_native_relation_in_strict_mode() {
+    fn blake2s_witness_inputs_emit_native_relation_rows() {
         let outputs: [Witness; 32] = std::array::from_fn(|index| Witness((3 + index) as u32));
         let circuit = Circuit {
             current_witness_index: 34,
@@ -5993,9 +7202,33 @@ mod tests {
             functions: vec![circuit],
             unconstrained_functions: Vec::new(),
         };
-        let err = compile_r1cs(&program).expect_err("strict mode should reject witness Blake2s");
+        let system =
+            compile_r1cs(&program).expect("strict mode should natively lower witness Blake2s");
+
+        let constant_outputs: [Witness; 32] = std::array::from_fn(|index| Witness(index as u32));
+        let constant_circuit = Circuit {
+            current_witness_index: 31,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Blake2s {
+                inputs: vec![
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'a'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'b'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'c'))),
+                ],
+                outputs: Box::new(constant_outputs),
+            })],
+            ..Circuit::default()
+        };
+        let constant_program = Program {
+            functions: vec![constant_circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let constant_system =
+            compile_r1cs(&constant_program).expect("constant Blake2s should lower natively");
         assert!(
-            format!("{err}").contains("Blake2s witness-driven native lowering is not implemented")
+            system.n_constraints > constant_system.n_constraints + 1_000,
+            "witness Blake2s should emit native relation rows (got {} vs constant {})",
+            system.n_constraints,
+            constant_system.n_constraints
         );
     }
 
@@ -6044,7 +7277,7 @@ mod tests {
     }
 
     #[test]
-    fn blake3_witness_inputs_require_native_relation_in_strict_mode() {
+    fn blake3_witness_inputs_emit_native_relation_rows() {
         let outputs: [Witness; 32] = std::array::from_fn(|index| Witness((3 + index) as u32));
         let circuit = Circuit {
             current_witness_index: 34,
@@ -6063,10 +7296,78 @@ mod tests {
             functions: vec![circuit],
             unconstrained_functions: Vec::new(),
         };
-        let err = compile_r1cs(&program).expect_err("strict mode should reject witness Blake3");
+        let system =
+            compile_r1cs(&program).expect("strict mode should natively lower witness Blake3");
+
+        let constant_outputs: [Witness; 32] = std::array::from_fn(|index| Witness(index as u32));
+        let constant_circuit = Circuit {
+            current_witness_index: 31,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Blake3 {
+                inputs: vec![
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'a'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'b'))),
+                    FunctionInput::Constant(FieldElement::from(u128::from(b'c'))),
+                ],
+                outputs: Box::new(constant_outputs),
+            })],
+            ..Circuit::default()
+        };
+        let constant_program = Program {
+            functions: vec![constant_circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let constant_system =
+            compile_r1cs(&constant_program).expect("constant Blake3 should lower natively");
         assert!(
-            format!("{err}").contains("Blake3 witness-driven native lowering is not implemented")
+            system.n_constraints > constant_system.n_constraints + 1_000,
+            "witness Blake3 should emit native relation rows (got {} vs constant {})",
+            system.n_constraints,
+            constant_system.n_constraints
         );
+    }
+
+    #[test]
+    fn blake3_witness_inputs_can_be_lowered_with_instance_witness_and_tamper_fails() {
+        let outputs: [Witness; 32] = std::array::from_fn(|index| Witness((3 + index) as u32));
+        let circuit = Circuit {
+            current_witness_index: 34,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Blake3 {
+                inputs: vec![
+                    FunctionInput::Witness(Witness(0)),
+                    FunctionInput::Witness(Witness(1)),
+                    FunctionInput::Witness(Witness(2)),
+                ],
+                outputs: Box::new(outputs),
+            })],
+            private_parameters: BTreeSet::from([Witness(0), Witness(1), Witness(2)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let mut witness = vec![FieldElement::zero(); 36];
+        witness[0] = FieldElement::one();
+        witness[1] = FieldElement::from(u128::from(b'a'));
+        witness[2] = FieldElement::from(u128::from(b'b'));
+        witness[3] = FieldElement::from(u128::from(b'c'));
+        let digest = blake3(b"abc").expect("blake3 should evaluate");
+        for (index, byte) in digest.into_iter().enumerate() {
+            witness[index + 4] = FieldElement::from(u128::from(byte));
+        }
+
+        let system = compile_r1cs_with_witness(&program, &witness)
+            .expect("witness-specialized Blake3 should lower in strict mode");
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered_input = witness.clone();
+        tampered_input[2] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_input));
+
+        let mut tampered_output = witness.clone();
+        tampered_output[10] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_output));
     }
 
     #[test]
@@ -6234,6 +7535,68 @@ mod tests {
     }
 
     #[test]
+    fn ecdsa_secp256r1_constant_inputs_are_natively_lowered_and_tamper_fails() {
+        let hashed_message: [u8; 32] = [
+            0x36, 0xfd, 0xcd, 0x91, 0x3a, 0x26, 0x69, 0x95, 0x4d, 0x21, 0x6a, 0xd8, 0x5b, 0xda,
+            0xd4, 0x95, 0xda, 0xf1, 0x9d, 0x88, 0x4b, 0x31, 0xd2, 0x1b, 0xc5, 0xc2, 0x05, 0xcb,
+            0x77, 0x05, 0x62, 0x54,
+        ];
+        let pub_key_x: [u8; 32] = [
+            0x21, 0xf3, 0xd5, 0xed, 0x25, 0x5b, 0x0d, 0xef, 0x29, 0x54, 0x41, 0x63, 0x37, 0x13,
+            0xc6, 0x5a, 0x98, 0x67, 0xb9, 0xda, 0x89, 0x59, 0x88, 0x23, 0xbe, 0xa4, 0xde, 0x99,
+            0xf4, 0x20, 0x79, 0x8c,
+        ];
+        let pub_key_y: [u8; 32] = [
+            0xa1, 0x81, 0x09, 0x38, 0x39, 0xc8, 0x33, 0x89, 0xef, 0xb4, 0x7c, 0x9c, 0xc9, 0xda,
+            0x77, 0x37, 0xac, 0x03, 0xbe, 0x05, 0x75, 0xcd, 0x64, 0x1c, 0xd2, 0xb8, 0xda, 0x8c,
+            0xba, 0xa7, 0x18, 0x04,
+        ];
+        let signature: [u8; 64] = [
+            0xf4, 0xf1, 0xff, 0xbf, 0x2b, 0x53, 0x9f, 0x08, 0xab, 0xd0, 0x2d, 0x7c, 0xef, 0x15,
+            0xc1, 0x09, 0x67, 0x1e, 0x70, 0x10, 0x01, 0x03, 0x92, 0xcc, 0x69, 0xd2, 0x58, 0x36,
+            0xa9, 0x24, 0x2f, 0xc8, 0x73, 0xb1, 0x6b, 0x86, 0x38, 0xa9, 0x16, 0xf7, 0x3f, 0xd2,
+            0x46, 0x13, 0xaa, 0xbc, 0x5a, 0xee, 0x66, 0x90, 0x85, 0x99, 0xe1, 0x82, 0xc6, 0xf2,
+            0x5e, 0xd3, 0x04, 0xd5, 0xe8, 0x0a, 0x69, 0x3c,
+        ];
+        let circuit = Circuit {
+            current_witness_index: 0,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::EcdsaSecp256r1 {
+                public_key_x: Box::new(
+                    pub_key_x
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                public_key_y: Box::new(
+                    pub_key_y
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                signature: Box::new(
+                    signature
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                hashed_message: Box::new(
+                    hashed_message
+                        .map(|byte| FunctionInput::Constant(FieldElement::from(u128::from(byte)))),
+                ),
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                output: Witness(0),
+            })],
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let system =
+            compile_r1cs(&program).expect("constant secp256r1 ECDSA should lower natively");
+        let witness_ok = vec![FieldElement::one(), FieldElement::one()];
+        assert!(system.is_satisfied(&witness_ok));
+        assert_r1cs_satisfied(&system, &witness_ok);
+
+        let witness_bad = vec![FieldElement::one(), FieldElement::zero()];
+        assert!(!system.is_satisfied(&witness_bad));
+    }
+
+    #[test]
     fn ecdsa_predicate_false_forces_true_output() {
         let public_key_x: [FunctionInput<FieldElement>; 32] =
             std::array::from_fn(|index| FunctionInput::Witness(Witness(index as u32)));
@@ -6373,6 +7736,86 @@ mod tests {
 
         let system = compile_r1cs_with_witness(&program, &witness)
             .expect("witness-specialized ECDSA should lower in strict mode");
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered_signature = witness.clone();
+        tampered_signature[80] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_signature));
+
+        let mut tampered_output = witness.clone();
+        tampered_output[161] = FieldElement::zero();
+        assert!(!system.is_satisfied(&tampered_output));
+    }
+
+    #[test]
+    fn ecdsa_secp256r1_witness_inputs_can_be_lowered_with_instance_witness_and_tamper_fails() {
+        let hashed_message: [u8; 32] = [
+            0x36, 0xfd, 0xcd, 0x91, 0x3a, 0x26, 0x69, 0x95, 0x4d, 0x21, 0x6a, 0xd8, 0x5b, 0xda,
+            0xd4, 0x95, 0xda, 0xf1, 0x9d, 0x88, 0x4b, 0x31, 0xd2, 0x1b, 0xc5, 0xc2, 0x05, 0xcb,
+            0x77, 0x05, 0x62, 0x54,
+        ];
+        let pub_key_x: [u8; 32] = [
+            0x21, 0xf3, 0xd5, 0xed, 0x25, 0x5b, 0x0d, 0xef, 0x29, 0x54, 0x41, 0x63, 0x37, 0x13,
+            0xc6, 0x5a, 0x98, 0x67, 0xb9, 0xda, 0x89, 0x59, 0x88, 0x23, 0xbe, 0xa4, 0xde, 0x99,
+            0xf4, 0x20, 0x79, 0x8c,
+        ];
+        let pub_key_y: [u8; 32] = [
+            0xa1, 0x81, 0x09, 0x38, 0x39, 0xc8, 0x33, 0x89, 0xef, 0xb4, 0x7c, 0x9c, 0xc9, 0xda,
+            0x77, 0x37, 0xac, 0x03, 0xbe, 0x05, 0x75, 0xcd, 0x64, 0x1c, 0xd2, 0xb8, 0xda, 0x8c,
+            0xba, 0xa7, 0x18, 0x04,
+        ];
+        let signature: [u8; 64] = [
+            0xf4, 0xf1, 0xff, 0xbf, 0x2b, 0x53, 0x9f, 0x08, 0xab, 0xd0, 0x2d, 0x7c, 0xef, 0x15,
+            0xc1, 0x09, 0x67, 0x1e, 0x70, 0x10, 0x01, 0x03, 0x92, 0xcc, 0x69, 0xd2, 0x58, 0x36,
+            0xa9, 0x24, 0x2f, 0xc8, 0x73, 0xb1, 0x6b, 0x86, 0x38, 0xa9, 0x16, 0xf7, 0x3f, 0xd2,
+            0x46, 0x13, 0xaa, 0xbc, 0x5a, 0xee, 0x66, 0x90, 0x85, 0x99, 0xe1, 0x82, 0xc6, 0xf2,
+            0x5e, 0xd3, 0x04, 0xd5, 0xe8, 0x0a, 0x69, 0x3c,
+        ];
+        let public_key_x: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(index as u32)));
+        let public_key_y: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(32 + index as u32)));
+        let signature_inputs: [FunctionInput<FieldElement>; 64] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(64 + index as u32)));
+        let hashed_message_inputs: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(128 + index as u32)));
+        let circuit = Circuit {
+            current_witness_index: 160,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::EcdsaSecp256r1 {
+                public_key_x: Box::new(public_key_x),
+                public_key_y: Box::new(public_key_y),
+                signature: Box::new(signature_inputs),
+                hashed_message: Box::new(hashed_message_inputs),
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                output: Witness(160),
+            })],
+            private_parameters: BTreeSet::from_iter((0..160).map(Witness)),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let mut witness = vec![FieldElement::zero(); 162];
+        witness[0] = FieldElement::one();
+        for (index, byte) in pub_key_x.iter().enumerate() {
+            witness[index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        for (index, byte) in pub_key_y.iter().enumerate() {
+            witness[32 + index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        for (index, byte) in signature.iter().enumerate() {
+            witness[64 + index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        for (index, byte) in hashed_message.iter().enumerate() {
+            witness[128 + index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        witness[161] = FieldElement::one();
+
+        let system = compile_r1cs_with_witness(&program, &witness)
+            .expect("witness-specialized secp256r1 ECDSA should lower in strict mode");
         assert!(system.is_satisfied(&witness));
         assert_r1cs_satisfied(&system, &witness);
 
