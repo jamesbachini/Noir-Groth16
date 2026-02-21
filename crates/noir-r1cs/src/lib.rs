@@ -133,12 +133,35 @@ pub fn compile_r1cs(program: &AcirProgram) -> Result<R1csSystem, R1csError> {
     compile_r1cs_with_options(program, LoweringOptions::strict())
 }
 
+pub fn compile_r1cs_with_witness(
+    program: &AcirProgram,
+    witness: &[FieldElement],
+) -> Result<R1csSystem, R1csError> {
+    compile_r1cs_with_options_and_witness(program, LoweringOptions::strict(), witness)
+}
+
 pub fn compile_r1cs_with_options(
     program: &AcirProgram,
     options: LoweringOptions,
 ) -> Result<R1csSystem, R1csError> {
+    compile_r1cs_with_options_and_optional_witness(program, options, None)
+}
+
+pub fn compile_r1cs_with_options_and_witness(
+    program: &AcirProgram,
+    options: LoweringOptions,
+    witness: &[FieldElement],
+) -> Result<R1csSystem, R1csError> {
+    compile_r1cs_with_options_and_optional_witness(program, options, Some(witness))
+}
+
+fn compile_r1cs_with_options_and_optional_witness(
+    program: &AcirProgram,
+    options: LoweringOptions,
+    witness: Option<&[FieldElement]>,
+) -> Result<R1csSystem, R1csError> {
     let circuit = program.functions.first().ok_or(R1csError::EmptyProgram)?;
-    LoweringContext::new_for_program(program, 0, circuit, options).lower()
+    LoweringContext::new_for_program(program, 0, circuit, options, witness).lower()
 }
 
 pub fn compile_r1cs_circuit(circuit: &AcirCircuit) -> Result<R1csSystem, R1csError> {
@@ -149,7 +172,7 @@ pub fn compile_r1cs_circuit_with_options(
     circuit: &AcirCircuit,
     options: LoweringOptions,
 ) -> Result<R1csSystem, R1csError> {
-    LoweringContext::new_for_circuit(circuit, options).lower()
+    LoweringContext::new_for_circuit(circuit, options, None).lower()
 }
 
 pub fn collect_unsupported_opcodes(
@@ -203,6 +226,7 @@ struct LoweringContext<'a> {
     current_function_index: usize,
     call_stack: Vec<usize>,
     circuit: &'a AcirCircuit,
+    instance_witness: Option<&'a [FieldElement]>,
     options: LoweringOptions,
     field_modulus_le_bytes: [u8; 32],
     wire_map: BTreeMap<u32, u32>,
@@ -257,8 +281,9 @@ impl<'a> LoweringContext<'a> {
         function_index: usize,
         circuit: &'a AcirCircuit,
         options: LoweringOptions,
+        instance_witness: Option<&'a [FieldElement]>,
     ) -> Self {
-        let mut this = Self::new_for_circuit(circuit, options);
+        let mut this = Self::new_for_circuit(circuit, options, instance_witness);
         this.program = Some(program);
         this.current_function_index = function_index;
         this.call_stack.push(function_index);
@@ -271,7 +296,11 @@ impl<'a> LoweringContext<'a> {
         this
     }
 
-    fn new_for_circuit(circuit: &'a AcirCircuit, options: LoweringOptions) -> Self {
+    fn new_for_circuit(
+        circuit: &'a AcirCircuit,
+        options: LoweringOptions,
+        instance_witness: Option<&'a [FieldElement]>,
+    ) -> Self {
         let mut wire_map = BTreeMap::new();
         for witness in 0..=circuit.current_witness_index {
             wire_map.insert(witness, witness + 1);
@@ -282,6 +311,7 @@ impl<'a> LoweringContext<'a> {
             current_function_index: 0,
             call_stack: Vec::new(),
             circuit,
+            instance_witness,
             options,
             field_modulus_le_bytes: bn254_modulus_le_bytes(),
             wire_map,
@@ -1520,12 +1550,33 @@ impl<'a> LoweringContext<'a> {
                     }
                     bytes.push(word as u8);
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "Blake2s witness-driven native lowering is not implemented".to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "Blake2s witness-driven native lowering is not implemented".to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::Blake2s input",
+                    )?;
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake2s witness input must fit into 8 bits, found {value}"),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake2s witness input must fit into 8 bits, found {value}"),
+                        );
+                    }
+                    bytes.push(word as u8);
                 }
             }
         }
@@ -1584,12 +1635,33 @@ impl<'a> LoweringContext<'a> {
                     }
                     bytes.push(word as u8);
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "Blake3 witness-driven native lowering is not implemented".to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "Blake3 witness-driven native lowering is not implemented".to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::Blake3 input",
+                    )?;
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake3 witness input must fit into 8 bits, found {value}"),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!("Blake3 witness input must fit into 8 bits, found {value}"),
+                        );
+                    }
+                    bytes.push(word as u8);
                 }
             }
         }
@@ -2071,12 +2143,29 @@ impl<'a> LoweringContext<'a> {
                     format!("ECDSA predicate must be 0 or 1, found {value}"),
                 );
             }
-            FunctionInput::Witness(_) => {
-                return self.lower_blackbox_with_mode(
-                    call,
-                    opcode_index,
-                    "ECDSA witness-driven native lowering is not implemented".to_string(),
-                )
+            FunctionInput::Witness(witness) => {
+                if self.instance_witness.is_none() {
+                    return self.lower_blackbox_with_mode(
+                        call,
+                        opcode_index,
+                        "ECDSA witness-driven native lowering is not implemented".to_string(),
+                    );
+                }
+                let value = self.constrain_witness_to_instance_value(
+                    *witness,
+                    "BlackBoxFuncCall::Ecdsa predicate",
+                )?;
+                if value.is_zero() {
+                    self.enforce_wire_equals_constant(output_wire, FieldElement::one())?;
+                    return Ok(());
+                }
+                if !value.is_one() {
+                    return self.unsupported_opcode(
+                        "BlackBoxFuncCall",
+                        opcode_index,
+                        format!("ECDSA predicate must be 0 or 1, found {value}"),
+                    );
+                }
             }
         }
 
@@ -2104,12 +2193,37 @@ impl<'a> LoweringContext<'a> {
                     }
                     pub_key_x[index] = word as u8;
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "ECDSA witness-driven native lowering is not implemented".to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "ECDSA witness-driven native lowering is not implemented".to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::Ecdsa public key x",
+                    )?;
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key x witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key x witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    pub_key_x[index] = word as u8;
                 }
             }
         }
@@ -2138,12 +2252,37 @@ impl<'a> LoweringContext<'a> {
                     }
                     pub_key_y[index] = word as u8;
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "ECDSA witness-driven native lowering is not implemented".to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "ECDSA witness-driven native lowering is not implemented".to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::Ecdsa public key y",
+                    )?;
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key y witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA public key y witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    pub_key_y[index] = word as u8;
                 }
             }
         }
@@ -2172,12 +2311,37 @@ impl<'a> LoweringContext<'a> {
                     }
                     signature_bytes[index] = word as u8;
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "ECDSA witness-driven native lowering is not implemented".to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "ECDSA witness-driven native lowering is not implemented".to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::Ecdsa signature",
+                    )?;
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA signature witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA signature witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    signature_bytes[index] = word as u8;
                 }
             }
         }
@@ -2206,12 +2370,37 @@ impl<'a> LoweringContext<'a> {
                     }
                     hashed_message_bytes[index] = word as u8;
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "ECDSA witness-driven native lowering is not implemented".to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "ECDSA witness-driven native lowering is not implemented".to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::Ecdsa hashed message",
+                    )?;
+                    let Some(word) = value.try_to_u32() else {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA hashed message witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    };
+                    if word > u32::from(u8::MAX) {
+                        return self.unsupported_opcode(
+                            "BlackBoxFuncCall",
+                            opcode_index,
+                            format!(
+                                "ECDSA hashed message witness input must fit into 8 bits, found {value}"
+                            ),
+                        );
+                    }
+                    hashed_message_bytes[index] = word as u8;
                 }
             }
         }
@@ -2357,13 +2546,19 @@ impl<'a> LoweringContext<'a> {
         for point in points {
             match point {
                 FunctionInput::Constant(value) => point_values.push(*value),
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "MultiScalarMul witness-driven native lowering is not implemented"
-                            .to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "MultiScalarMul witness-driven native lowering is not implemented"
+                                .to_string(),
+                        );
+                    }
+                    point_values.push(self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::MultiScalarMul point",
+                    )?);
                 }
             }
         }
@@ -2379,13 +2574,24 @@ impl<'a> LoweringContext<'a> {
                         scalar_hi.push(*value);
                     }
                 }
-                FunctionInput::Witness(_) => {
-                    return self.lower_blackbox_with_mode(
-                        call,
-                        opcode_index,
-                        "MultiScalarMul witness-driven native lowering is not implemented"
-                            .to_string(),
-                    )
+                FunctionInput::Witness(witness) => {
+                    if self.instance_witness.is_none() {
+                        return self.lower_blackbox_with_mode(
+                            call,
+                            opcode_index,
+                            "MultiScalarMul witness-driven native lowering is not implemented"
+                                .to_string(),
+                        );
+                    }
+                    let value = self.constrain_witness_to_instance_value(
+                        *witness,
+                        "BlackBoxFuncCall::MultiScalarMul scalar",
+                    )?;
+                    if index.is_multiple_of(2) {
+                        scalar_lo.push(value);
+                    } else {
+                        scalar_hi.push(value);
+                    }
                 }
             }
         }
@@ -3442,6 +3648,41 @@ impl<'a> LoweringContext<'a> {
         }
 
         Ok(())
+    }
+
+    fn instance_witness_value(
+        &self,
+        witness: Witness,
+        context: &str,
+    ) -> Result<FieldElement, R1csError> {
+        let Some(values) = self.instance_witness else {
+            return Err(R1csError::InvalidProgramInvariant {
+                details: format!("{context}: no instance witness values are available"),
+            });
+        };
+        let vector_index = witness.witness_index() as usize + 1;
+        values
+            .get(vector_index)
+            .copied()
+            .ok_or_else(|| R1csError::InvalidProgramInvariant {
+                details: format!(
+                    "{context}: missing witness value for witness {} at witness vector index {}",
+                    witness.witness_index(),
+                    vector_index
+                ),
+            })
+    }
+
+    fn constrain_witness_to_instance_value(
+        &mut self,
+        witness: Witness,
+        context: &str,
+    ) -> Result<FieldElement, R1csError> {
+        self.ensure_witness_in_range(witness, context)?;
+        let wire = self.wire_for_witness(witness)?;
+        let value = self.instance_witness_value(witness, context)?;
+        self.enforce_wire_equals_constant(wire, value)?;
+        Ok(value)
     }
 
     fn ensure_witness_in_range(&self, witness: Witness, context: &str) -> Result<(), R1csError> {
@@ -5386,6 +5627,73 @@ mod tests {
     }
 
     #[test]
+    fn multi_scalar_mul_witness_inputs_can_be_lowered_with_instance_witness_and_tamper_fails() {
+        let generator_x =
+            field_from_hex("083e7911d835097629f0067531fc15cafd79a89beecb39903f69572c636f4a5a");
+        let generator_y =
+            field_from_hex("1a7f5efaad7f315c25a918f30cc8d7333fccab7ad7c90f14de81bcc528f9935d");
+        let circuit = Circuit {
+            current_witness_index: 7,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::MultiScalarMul {
+                points: vec![
+                    FunctionInput::Witness(Witness(0)),
+                    FunctionInput::Witness(Witness(1)),
+                    FunctionInput::Witness(Witness(2)),
+                ],
+                scalars: vec![
+                    FunctionInput::Witness(Witness(3)),
+                    FunctionInput::Witness(Witness(4)),
+                ],
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                outputs: (Witness(5), Witness(6), Witness(7)),
+            })],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let (output_x, output_y, output_infinite) = bn254_multi_scalar_mul(
+            &[generator_x, generator_y, FieldElement::zero()],
+            &[FieldElement::one()],
+            &[FieldElement::zero()],
+        )
+        .expect("constant multi-scalar multiplication should succeed");
+
+        let witness = vec![
+            FieldElement::one(),
+            generator_x,
+            generator_y,
+            FieldElement::zero(),
+            FieldElement::one(),
+            FieldElement::zero(),
+            output_x,
+            output_y,
+            output_infinite,
+        ];
+        let system = compile_r1cs_with_witness(&program, &witness)
+            .expect("witness-specialized MultiScalarMul should lower in strict mode");
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered_input = witness.clone();
+        tampered_input[2] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_input));
+
+        let mut tampered_output = witness.clone();
+        tampered_output[7] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_output));
+    }
+
+    #[test]
     fn allow_unsupported_collects_coverage_without_emitting_r1cs() {
         let circuit = Circuit {
             current_witness_index: 1,
@@ -5692,6 +6000,50 @@ mod tests {
     }
 
     #[test]
+    fn blake2s_witness_inputs_can_be_lowered_with_instance_witness_and_tamper_fails() {
+        let outputs: [Witness; 32] = std::array::from_fn(|index| Witness((3 + index) as u32));
+        let circuit = Circuit {
+            current_witness_index: 34,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::Blake2s {
+                inputs: vec![
+                    FunctionInput::Witness(Witness(0)),
+                    FunctionInput::Witness(Witness(1)),
+                    FunctionInput::Witness(Witness(2)),
+                ],
+                outputs: Box::new(outputs),
+            })],
+            private_parameters: BTreeSet::from([Witness(0), Witness(1), Witness(2)]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+        let mut witness = vec![FieldElement::zero(); 36];
+        witness[0] = FieldElement::one();
+        witness[1] = FieldElement::from(u128::from(b'a'));
+        witness[2] = FieldElement::from(u128::from(b'b'));
+        witness[3] = FieldElement::from(u128::from(b'c'));
+        let digest = blake2s(b"abc").expect("blake2s should evaluate");
+        for (index, byte) in digest.into_iter().enumerate() {
+            witness[index + 4] = FieldElement::from(u128::from(byte));
+        }
+
+        let system = compile_r1cs_with_witness(&program, &witness)
+            .expect("witness-specialized Blake2s should lower in strict mode");
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered_input = witness.clone();
+        tampered_input[2] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_input));
+
+        let mut tampered_output = witness.clone();
+        tampered_output[10] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_output));
+    }
+
+    #[test]
     fn blake3_witness_inputs_require_native_relation_in_strict_mode() {
         let outputs: [Witness; 32] = std::array::from_fn(|index| Witness((3 + index) as u32));
         let circuit = Circuit {
@@ -5951,6 +6303,86 @@ mod tests {
         assert!(
             format!("{err}").contains("ECDSA witness-driven native lowering is not implemented")
         );
+    }
+
+    #[test]
+    fn ecdsa_witness_inputs_can_be_lowered_with_instance_witness_and_tamper_fails() {
+        let hashed_message: [u8; 32] = [
+            0x3a, 0x73, 0xf4, 0x12, 0x3a, 0x5c, 0xd2, 0x12, 0x1f, 0x21, 0xcd, 0x7e, 0x8d, 0x35,
+            0x88, 0x35, 0x47, 0x69, 0x49, 0xd0, 0x35, 0xd9, 0xc2, 0xda, 0x68, 0x06, 0xb4, 0x63,
+            0x3a, 0xc8, 0xc1, 0xe2,
+        ];
+        let pub_key_x: [u8; 32] = [
+            0xa0, 0x43, 0x4d, 0x9e, 0x47, 0xf3, 0xc8, 0x62, 0x35, 0x47, 0x7c, 0x7b, 0x1a, 0xe6,
+            0xae, 0x5d, 0x34, 0x42, 0xd4, 0x9b, 0x19, 0x43, 0xc2, 0xb7, 0x52, 0xa6, 0x8e, 0x2a,
+            0x47, 0xe2, 0x47, 0xc7,
+        ];
+        let pub_key_y: [u8; 32] = [
+            0x89, 0x3a, 0xba, 0x42, 0x54, 0x19, 0xbc, 0x27, 0xa3, 0xb6, 0xc7, 0xe6, 0x93, 0xa2,
+            0x4c, 0x69, 0x6f, 0x79, 0x4c, 0x2e, 0xd8, 0x77, 0xa1, 0x59, 0x3c, 0xbe, 0xe5, 0x3b,
+            0x03, 0x73, 0x68, 0xd7,
+        ];
+        let signature: [u8; 64] = [
+            0xe5, 0x08, 0x1c, 0x80, 0xab, 0x42, 0x7d, 0xc3, 0x70, 0x34, 0x6f, 0x4a, 0x0e, 0x31,
+            0xaa, 0x2b, 0xad, 0x8d, 0x97, 0x98, 0xc3, 0x80, 0x61, 0xdb, 0x9a, 0xe5, 0x5a, 0x4e,
+            0x8d, 0xf4, 0x54, 0xfd, 0x28, 0x11, 0x98, 0x94, 0x34, 0x4e, 0x71, 0xb7, 0x87, 0x70,
+            0xcc, 0x93, 0x1d, 0x61, 0xf4, 0x80, 0xec, 0xbb, 0x0b, 0x89, 0xd6, 0xeb, 0x69, 0x69,
+            0x01, 0x61, 0xe4, 0x9a, 0x71, 0x5f, 0xcd, 0x55,
+        ];
+        let public_key_x: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(index as u32)));
+        let public_key_y: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(32 + index as u32)));
+        let signature_inputs: [FunctionInput<FieldElement>; 64] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(64 + index as u32)));
+        let hashed_message_inputs: [FunctionInput<FieldElement>; 32] =
+            std::array::from_fn(|index| FunctionInput::Witness(Witness(128 + index as u32)));
+        let circuit = Circuit {
+            current_witness_index: 160,
+            opcodes: vec![Opcode::BlackBoxFuncCall(BlackBoxFuncCall::EcdsaSecp256k1 {
+                public_key_x: Box::new(public_key_x),
+                public_key_y: Box::new(public_key_y),
+                signature: Box::new(signature_inputs),
+                hashed_message: Box::new(hashed_message_inputs),
+                predicate: FunctionInput::Constant(FieldElement::one()),
+                output: Witness(160),
+            })],
+            private_parameters: BTreeSet::from_iter((0..160).map(Witness)),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let mut witness = vec![FieldElement::zero(); 162];
+        witness[0] = FieldElement::one();
+        for (index, byte) in pub_key_x.iter().enumerate() {
+            witness[index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        for (index, byte) in pub_key_y.iter().enumerate() {
+            witness[32 + index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        for (index, byte) in signature.iter().enumerate() {
+            witness[64 + index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        for (index, byte) in hashed_message.iter().enumerate() {
+            witness[128 + index + 1] = FieldElement::from(u128::from(*byte));
+        }
+        witness[161] = FieldElement::one();
+
+        let system = compile_r1cs_with_witness(&program, &witness)
+            .expect("witness-specialized ECDSA should lower in strict mode");
+        assert!(system.is_satisfied(&witness));
+        assert_r1cs_satisfied(&system, &witness);
+
+        let mut tampered_signature = witness.clone();
+        tampered_signature[80] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_signature));
+
+        let mut tampered_output = witness.clone();
+        tampered_output[161] = FieldElement::zero();
+        assert!(!system.is_satisfied(&tampered_output));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
 };
 
 use noir_acir::Artifact;
-use noir_r1cs::compile_r1cs;
+use noir_r1cs::compile_r1cs_with_witness;
 use noir_witness::{generate_witness_with_options, WitnessSolveOptions};
 use tempfile::TempDir;
 
@@ -85,7 +85,8 @@ fn run_project_differential_check(project_dir: &Path) {
     let witness =
         generate_witness_with_options(&artifact, &inputs_json, WitnessSolveOptions::pedantic())
             .expect("ACVM witness generation should succeed");
-    let system = compile_r1cs(&artifact.program).expect("R1CS lowering should succeed");
+    let system = compile_r1cs_with_witness(&artifact.program, &witness.witness_vector)
+        .expect("R1CS lowering should succeed");
     let materialized = system
         .materialize_witness(&witness.witness_vector)
         .expect("witness should materialize to R1CS wire count");

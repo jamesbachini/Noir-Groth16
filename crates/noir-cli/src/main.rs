@@ -8,8 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use noir_acir::Artifact;
 use noir_r1cs::{
-    compile_r1cs, compile_r1cs_with_options, write_r1cs_binary, write_r1cs_json, LoweringOptions,
-    R1csError, UnsupportedOpcodeInfo,
+    compile_r1cs, compile_r1cs_with_options, compile_r1cs_with_witness, write_r1cs_binary,
+    write_r1cs_json, LoweringOptions, R1csError, UnsupportedOpcodeInfo,
 };
 use noir_witness::{
     generate_witness_from_json_str_with_options, generate_witness_with_options, WitnessArtifacts,
@@ -158,8 +158,9 @@ fn r1cs_json_cmd(
     }
 
     let diagnostics_path = unsupported_report_path_for_r1cs_json(out_path);
-    let system = compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path))
-        .context("failed compiling R1CS")?;
+    let system =
+        compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path), None)
+            .context("failed compiling R1CS")?;
 
     write_r1cs_json(&system, out_path)
         .with_context(|| format!("failed writing `{}`", out_path.display()))?;
@@ -193,8 +194,13 @@ fn interop_cmd(
     )
     .context("failed generating witness")?;
     let diagnostics_path = out_dir.join("unsupported_opcodes.json");
-    let system = compile_r1cs_for_command(&artifact, allow_unsupported, Some(&diagnostics_path))
-        .context("failed compiling R1CS")?;
+    let system = compile_r1cs_for_command(
+        &artifact,
+        allow_unsupported,
+        Some(&diagnostics_path),
+        Some(&witness.witness_vector),
+    )
+    .context("failed compiling R1CS")?;
     witness.witness_vector = system
         .materialize_witness(&witness.witness_vector)
         .ok_or_else(|| anyhow!("failed materializing witness for {} wires", system.n_wires))?;
@@ -220,9 +226,14 @@ fn compile_r1cs_for_command(
     artifact: &Artifact,
     allow_unsupported: bool,
     diagnostics_path: Option<&PathBuf>,
+    witness: Option<&[acir::FieldElement]>,
 ) -> Result<noir_r1cs::R1csSystem> {
     if !allow_unsupported {
-        return match compile_r1cs(&artifact.program) {
+        let strict_result = match witness {
+            Some(values) => compile_r1cs_with_witness(&artifact.program, values),
+            None => compile_r1cs(&artifact.program),
+        };
+        return match strict_result {
             Ok(system) => Ok(system),
             Err(R1csError::UnsupportedOpcode { info }) => anyhow::bail!(
                 "strict lowering failed: unsupported opcode `{}` at index {} in function {}\n  predicate_state: {}\n  exact_opcode: {}\n  details: {}\n  workaround: {}",
