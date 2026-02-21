@@ -8,6 +8,10 @@ Pipeline:
 3. Lower supported ACIR constraints into R1CS.
 4. Emit deterministic artifacts (`.r1cs`, `.wtns`, JSON/bin debug outputs).
 
+## Docs
+
+https://jamesbachini.github.io/Noir-Groth16/
+
 ## Workspace Layout
 
 - `crates/noir-acir`: Noir artifact parsing, ABI modeling, witness layout helpers.

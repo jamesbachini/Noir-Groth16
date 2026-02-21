@@ -28,17 +28,6 @@ Pipeline:
 - [Technical Reference](technical-reference): crate boundaries, invariants, and format notes.
 - [Troubleshooting](troubleshooting): common failure modes and fixes.
 
-## GitHub Pages publishing
-
-Use repository settings:
-
-1. `Settings` -> `Pages`
-2. `Source`: `Deploy from a branch`
-3. Branch: your default branch
-4. Folder: `/docs`
-
-This directory includes Jekyll config (`docs/_config.yml`) and page front matter for navigation.
-
 ## Repository scope
 
 This workspace is organized around these crates:
