@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMMON_SH="${ROOT_DIR}/scripts/lib/common.sh"
 NETWORK="${NETWORK:-testnet}"
 SOURCE_ACCOUNT="${SOURCE_ACCOUNT:-${STELLAR_ACCOUNT:-}}"
 RUN_CIRCUIT_SCRIPT="${ROOT_DIR}/scripts/run_circuit.sh"
@@ -13,19 +14,23 @@ LOCAL_VERIFY_KEY_PATH="${PROOF_DIR}/verification_key.json"
 LOCAL_PUBLIC_PATH="${PROOF_DIR}/public.json"
 LOCAL_PROOF_PATH="${PROOF_DIR}/proof.json"
 LOCAL_ENCODER_SCRIPT="${ROOT_DIR}/scripts/encode_bn254_for_soroban.mjs"
+MIN_CARGO_VERSION="${MIN_CARGO_VERSION:-1.89.0}"
+MIN_RUSTC_VERSION="${MIN_RUSTC_VERSION:-1.89.0}"
+MIN_NODE_VERSION="${MIN_NODE_VERSION:-18.0.0}"
+MIN_NPM_VERSION="${MIN_NPM_VERSION:-8.0.0}"
+MIN_SNARKJS_VERSION="${MIN_SNARKJS_VERSION:-0.7.0}"
+MIN_STELLAR_VERSION="${MIN_STELLAR_VERSION:-22.0.0}"
+SOROBAN_RUST_TARGET="${SOROBAN_RUST_TARGET:-wasm32v1-none}"
 
-require_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "missing required command: $1" >&2
-    exit 1
-  fi
-}
+if [[ ! -f "${COMMON_SH}" ]]; then
+  echo "missing required helper script: ${COMMON_SH}" >&2
+  exit 1
+fi
+# shellcheck source=./lib/common.sh
+source "${COMMON_SH}"
 
-require_file() {
-  if [[ ! -f "$1" ]]; then
-    echo "missing required file: $1" >&2
-    exit 1
-  fi
+snarkjs() {
+  ng16_snarkjs "$@"
 }
 
 run_converter() {
@@ -34,48 +39,60 @@ run_converter() {
   local output_path="$3"
 
   if [[ "${CONVERTER_MODE}" == "node" ]]; then
-    node "${LOCAL_ENCODER_SCRIPT}" "$mode" "$input_path" >"$output_path"
+    node "${LOCAL_ENCODER_SCRIPT}" "${mode}" "${input_path}" >"${output_path}"
     return
   fi
 
   if [[ "${CONVERTER_MODE}" == "path" ]]; then
-    circom-to-soroban-hex "$mode" "$input_path" >"$output_path"
+    circom-to-soroban-hex "${mode}" "${input_path}" >"${output_path}"
     return
   fi
 
   if [[ "${CONVERTER_MODE}" == "cargo" ]]; then
-    cargo run --quiet -p circom-to-soroban-hex -- "$mode" "$input_path" >"$output_path"
+    cargo run --quiet -p circom-to-soroban-hex -- "${mode}" "${input_path}" >"${output_path}"
     return
   fi
 
-  echo "internal error: unsupported converter mode ${CONVERTER_MODE}" >&2
-  exit 1
+  ng16_error "internal error: unsupported converter mode ${CONVERTER_MODE}"
 }
 
-require_cmd cargo
-require_cmd npx
-require_cmd stellar
-require_cmd node
-require_cmd mktemp
-require_cmd cp
+ng16_detect_platform
 
-require_file "${RUN_CIRCUIT_SCRIPT}"
-require_file "${CONTRACTS_DIR}/Cargo.toml"
-require_file "${LOCAL_ENCODER_SCRIPT}"
+ng16_require_cmd cargo "$(ng16_hint_cargo)"
+ng16_require_cmd rustc "$(ng16_hint_cargo)"
+ng16_require_cmd node "$(ng16_hint_node)"
+ng16_require_cmd npm "$(ng16_hint_node)"
+ng16_require_cmd mktemp
+ng16_require_cmd cp
+ng16_require_cmd tr
+ng16_require_cmd grep
+ng16_require_cmd tail
+
+ng16_require_min_version "cargo" "$(cargo --version 2>&1 | head -n1)" "${MIN_CARGO_VERSION}" "$(ng16_hint_cargo)"
+ng16_require_min_version "rustc" "$(rustc --version 2>&1 | head -n1)" "${MIN_RUSTC_VERSION}" "$(ng16_hint_cargo)"
+ng16_require_min_version "node" "$(node --version 2>&1 | head -n1)" "${MIN_NODE_VERSION}" "$(ng16_hint_node)"
+ng16_require_min_version "npm" "$(npm --version 2>&1 | head -n1)" "${MIN_NPM_VERSION}" "$(ng16_hint_node)"
+
+ng16_ensure_stellar "${MIN_STELLAR_VERSION}"
+ng16_ensure_snarkjs "${MIN_SNARKJS_VERSION}"
+ng16_ensure_rust_target "${SOROBAN_RUST_TARGET}"
+
+ng16_require_file "${RUN_CIRCUIT_SCRIPT}"
+ng16_require_file "${CONTRACTS_DIR}/Cargo.toml"
+ng16_require_file "${LOCAL_ENCODER_SCRIPT}"
 
 echo "[1/7] Running circuit pipeline via scripts/run_circuit.sh"
-"${RUN_CIRCUIT_SCRIPT}"
+bash "${RUN_CIRCUIT_SCRIPT}"
 
-require_file "${LOCAL_VERIFY_KEY_PATH}"
-require_file "${LOCAL_PUBLIC_PATH}"
-require_file "${LOCAL_PROOF_PATH}"
+ng16_require_file "${LOCAL_VERIFY_KEY_PATH}"
+ng16_require_file "${LOCAL_PUBLIC_PATH}"
+ng16_require_file "${LOCAL_PROOF_PATH}"
 
 echo "[2/7] Re-checking proof locally with snarkjs before deploy"
-LOCAL_VERIFY_OUTPUT="$(npx --yes snarkjs groth16 verify "${LOCAL_VERIFY_KEY_PATH}" "${LOCAL_PUBLIC_PATH}" "${LOCAL_PROOF_PATH}")"
+LOCAL_VERIFY_OUTPUT="$(snarkjs groth16 verify "${LOCAL_VERIFY_KEY_PATH}" "${LOCAL_PUBLIC_PATH}" "${LOCAL_PROOF_PATH}")"
 printf '%s\n' "${LOCAL_VERIFY_OUTPUT}"
 if [[ "${LOCAL_VERIFY_OUTPUT}" != *"OK"* && "${LOCAL_VERIFY_OUTPUT}" != *"ok"* ]]; then
-  echo "local snarkjs verification did not report success" >&2
-  exit 1
+  ng16_error "local snarkjs verification did not report success."
 fi
 
 VK_CURVE="$(
@@ -87,7 +104,7 @@ process.stdout.write(String(vk.curve || "").toLowerCase());
 )"
 if [[ "${VK_CURVE}" != "bn128" && "${VK_CURVE}" != "bn254" ]]; then
   cat >&2 <<EOF
-verification key curve is '${VK_CURVE}', but this script expects BN254/bn128 artifacts.
+error: verification key curve is '${VK_CURVE}', but this script expects BN254/bn128 artifacts.
 run_circuit.sh should emit a bn128 verification key for this contract flow.
 EOF
   exit 1
@@ -105,7 +122,7 @@ fi
 
 if [[ "${CONVERTER_MODE}" == "missing" ]]; then
   cat >&2 <<'EOF'
-missing required encoder.
+error: missing required encoder.
 expected scripts/encode_bn254_for_soroban.mjs, or circom-to-soroban-hex on PATH, or circom-to-soroban-hex in the cargo workspace.
 EOF
   exit 1
@@ -136,8 +153,8 @@ overflow-checks = true
 EOF
 fi
 stellar contract build --manifest-path "${TEMP_CONTRACT_MANIFEST}" --package soroban-groth16-verifier --optimize
-WASM_PATH="${TEMP_CONTRACT_DIR}/target/wasm32v1-none/release/soroban_groth16_verifier.wasm"
-require_file "${WASM_PATH}"
+WASM_PATH="${TEMP_CONTRACT_DIR}/target/${SOROBAN_RUST_TARGET}/release/soroban_groth16_verifier.wasm"
+ng16_require_file "${WASM_PATH}"
 
 echo "[4/7] Deploying verifier contract to ${NETWORK}"
 deploy_cmd=(stellar contract deploy --wasm "${WASM_PATH}" --network "${NETWORK}")
@@ -148,8 +165,7 @@ DEPLOY_OUTPUT="$("${deploy_cmd[@]}")"
 printf '%s\n' "${DEPLOY_OUTPUT}"
 CONTRACT_ID="$(printf '%s\n' "${DEPLOY_OUTPUT}" | grep -Eo 'C[A-Z2-7]{55}' | tail -n1 || true)"
 if [[ -z "${CONTRACT_ID}" ]]; then
-  echo "failed to parse contract id from deploy output" >&2
-  exit 1
+  ng16_error "failed to parse contract id from deploy output."
 fi
 echo "Contract ID: ${CONTRACT_ID}"
 
@@ -177,8 +193,7 @@ fi
 VERIFY_RESULT="$("${verify_cmd[@]}")"
 echo "On-chain verification result: ${VERIFY_RESULT}"
 if [[ "${VERIFY_RESULT}" != "true" ]]; then
-  echo "on-chain verification did not return true" >&2
-  exit 1
+  ng16_error "on-chain verification did not return true."
 fi
 
 echo "Success: Groth16 proof verified on-chain on ${NETWORK}."

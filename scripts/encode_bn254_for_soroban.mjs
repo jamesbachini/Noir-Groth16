@@ -2,9 +2,54 @@
 
 import fs from "node:fs";
 
+const MIN_NODE_VERSION = process.env.MIN_NODE_VERSION || "18.0.0";
+
 function fail(message) {
   console.error(message);
   process.exit(1);
+}
+
+function parseSemver(value) {
+  const match = String(value).match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function versionGte(observed, minimum) {
+  for (let i = 0; i < 3; i += 1) {
+    if (observed[i] > minimum[i]) {
+      return true;
+    }
+    if (observed[i] < minimum[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function nodeInstallHint() {
+  if (process.platform === "darwin") {
+    return "Install Node.js with 'brew install node' or from https://nodejs.org/.";
+  }
+  return "Install Node.js from your package manager or https://nodejs.org/.";
+}
+
+function assertNodeVersion() {
+  const observed = parseSemver(process.version);
+  const minimum = parseSemver(MIN_NODE_VERSION);
+  if (!observed || !minimum) {
+    fail(
+      `unable to parse Node.js version (observed '${process.version}', minimum '${MIN_NODE_VERSION}').`
+    );
+  }
+
+  if (!versionGte(observed, minimum)) {
+    fail(
+      `Node.js ${process.version} is too old; require >= ${MIN_NODE_VERSION}. ${nodeInstallHint()}`
+    );
+  }
 }
 
 function usage() {
@@ -142,6 +187,8 @@ function encodePublic(publicSignals) {
 }
 
 function main() {
+  assertNodeVersion();
+
   const mode = process.argv[2];
   const inputPath = process.argv[3];
   if (!mode || !inputPath) {

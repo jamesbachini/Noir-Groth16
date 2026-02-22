@@ -2,34 +2,43 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMMON_SH="${ROOT_DIR}/scripts/lib/common.sh"
 CIRCUIT_DIR="${CIRCUIT_DIR:-${ROOT_DIR}/circuits}"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/target/groth16}"
 PTAU_POWER="${PTAU_POWER:-12}"
+MIN_CARGO_VERSION="${MIN_CARGO_VERSION:-1.75.0}"
+MIN_NARGO_VERSION="${MIN_NARGO_VERSION:-1.0.0}"
+MIN_NODE_VERSION="${MIN_NODE_VERSION:-18.0.0}"
+MIN_NPM_VERSION="${MIN_NPM_VERSION:-8.0.0}"
+MIN_SNARKJS_VERSION="${MIN_SNARKJS_VERSION:-0.7.0}"
 
-require_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "missing required command: $1" >&2
-    exit 1
-  fi
-}
-
-require_file() {
-  if [[ ! -f "$1" ]]; then
-    echo "missing required file: $1" >&2
-    exit 1
-  fi
-}
+if [[ ! -f "${COMMON_SH}" ]]; then
+  echo "missing required helper script: ${COMMON_SH}" >&2
+  exit 1
+fi
+# shellcheck source=./lib/common.sh
+source "${COMMON_SH}"
 
 snarkjs() {
-  npx -y snarkjs "$@"
+  ng16_snarkjs "$@"
 }
 
-require_cmd cargo
-require_cmd nargo
-require_cmd npx
+ng16_detect_platform
 
-require_file "${CIRCUIT_DIR}/Nargo.toml"
-require_file "${CIRCUIT_DIR}/inputs.json"
+ng16_require_cmd awk
+ng16_require_cmd cargo "$(ng16_hint_cargo)"
+ng16_require_cmd nargo "$(ng16_hint_nargo)"
+ng16_require_cmd node "$(ng16_hint_node)"
+ng16_require_cmd npm "$(ng16_hint_node)"
+
+ng16_require_min_version "cargo" "$(cargo --version 2>&1 | head -n1)" "${MIN_CARGO_VERSION}" "$(ng16_hint_cargo)"
+ng16_require_min_version "nargo" "$(nargo --version 2>&1 | head -n1)" "${MIN_NARGO_VERSION}" "$(ng16_hint_nargo)"
+ng16_require_min_version "node" "$(node --version 2>&1 | head -n1)" "${MIN_NODE_VERSION}" "$(ng16_hint_node)"
+ng16_require_min_version "npm" "$(npm --version 2>&1 | head -n1)" "${MIN_NPM_VERSION}" "$(ng16_hint_node)"
+ng16_ensure_snarkjs "${MIN_SNARKJS_VERSION}"
+
+ng16_require_file "${CIRCUIT_DIR}/Nargo.toml"
+ng16_require_file "${CIRCUIT_DIR}/inputs.json"
 
 PACKAGE_NAME="$(
   awk -F '=' '
@@ -42,8 +51,7 @@ PACKAGE_NAME="$(
 )"
 
 if [[ -z "${PACKAGE_NAME}" ]]; then
-  echo "failed to parse package name from ${CIRCUIT_DIR}/Nargo.toml" >&2
-  exit 1
+  ng16_error "failed to parse package name from ${CIRCUIT_DIR}/Nargo.toml"
 fi
 
 ARTIFACT_PATH="${CIRCUIT_DIR}/target/${PACKAGE_NAME}.json"
@@ -63,8 +71,7 @@ echo "[2/6] Compiling Noir circuit (${CIRCUIT_DIR})"
 (cd "${CIRCUIT_DIR}" && nargo compile)
 
 if [[ ! -f "${ARTIFACT_PATH}" ]]; then
-  echo "compiled artifact not found: ${ARTIFACT_PATH}" >&2
-  exit 1
+  ng16_error "compiled artifact not found: ${ARTIFACT_PATH}"
 fi
 
 rm -rf "${INTEROP_DIR}" "${PROOF_DIR}"
@@ -96,8 +103,7 @@ snarkjs groth16 prove "${PROOF_DIR}/circuit_final.zkey" "${PROOF_DIR}/witness.wt
 VERIFY_OUTPUT="$(snarkjs groth16 verify "${VERIFY_KEY_PATH}" "${PUBLIC_PATH}" "${PROOF_PATH}")"
 printf '%s\n' "${VERIFY_OUTPUT}"
 if [[ "${VERIFY_OUTPUT}" != *"OK"* && "${VERIFY_OUTPUT}" != *"ok"* ]]; then
-  echo "verification did not report success" >&2
-  exit 1
+  ng16_error "verification did not report success."
 fi
 
 echo
