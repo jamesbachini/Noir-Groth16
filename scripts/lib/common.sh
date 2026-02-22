@@ -195,12 +195,14 @@ ng16_ensure_snarkjs() {
   local minimum="${1:-0.7.0}"
   local hint
   local version_output
+  local snarkjs_path
 
   hint="$(ng16_hint_snarkjs)"
 
-  if command -v snarkjs >/dev/null 2>&1; then
+  snarkjs_path="$(type -P snarkjs || true)"
+  if [[ -n "${snarkjs_path}" ]]; then
     NG16_SNARKJS_MODE="cmd"
-    NG16_SNARKJS_BIN="$(command -v snarkjs)"
+    NG16_SNARKJS_BIN="${snarkjs_path}"
   elif command -v npx >/dev/null 2>&1 && npx --yes snarkjs --version >/dev/null 2>&1; then
     NG16_SNARKJS_MODE="npx"
     NG16_SNARKJS_BIN=""

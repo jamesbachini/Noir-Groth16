@@ -19,10 +19,6 @@ fi
 # shellcheck source=./lib/common.sh
 source "${COMMON_SH}"
 
-snarkjs() {
-  ng16_snarkjs "$@"
-}
-
 ng16_detect_platform
 
 ng16_require_cmd awk
@@ -81,12 +77,12 @@ echo "[3/6] Emitting interop artifacts (.r1cs + .wtns)"
 "${NOIR_CLI}" interop "${ARTIFACT_PATH}" "${CIRCUIT_DIR}/inputs.json" --out "${INTEROP_DIR}"
 
 echo "[4/6] Checking witness consistency"
-snarkjs wtns check "${INTEROP_DIR}/circuit.r1cs" "${INTEROP_DIR}/witness.wtns"
+ng16_snarkjs wtns check "${INTEROP_DIR}/circuit.r1cs" "${INTEROP_DIR}/witness.wtns"
 
 if [[ ! -f "${PTAU_FINAL}" ]]; then
   echo "[5/6] Preparing powers of tau (bn128, power=${PTAU_POWER})"
-  snarkjs powersoftau new bn128 "${PTAU_POWER}" "${PTAU_INITIAL}"
-  snarkjs powersoftau prepare phase2 "${PTAU_INITIAL}" "${PTAU_FINAL}"
+  ng16_snarkjs powersoftau new bn128 "${PTAU_POWER}" "${PTAU_INITIAL}"
+  ng16_snarkjs powersoftau prepare phase2 "${PTAU_INITIAL}" "${PTAU_FINAL}"
 else
   echo "[5/6] Reusing existing powers of tau: ${PTAU_FINAL}"
 fi
@@ -95,12 +91,12 @@ mkdir -p "${PROOF_DIR}"
 cp "${INTEROP_DIR}/circuit.r1cs" "${INTEROP_DIR}/witness.wtns" "${PROOF_DIR}/"
 
 echo "[6/6] Running Groth16 setup, prove, and verify"
-snarkjs groth16 setup "${PROOF_DIR}/circuit.r1cs" "${PTAU_FINAL}" "${PROOF_DIR}/circuit_0000.zkey"
-snarkjs zkey contribute "${PROOF_DIR}/circuit_0000.zkey" "${PROOF_DIR}/circuit_final.zkey" --name="local" -e="local deterministic entropy"
-snarkjs zkey export verificationkey "${PROOF_DIR}/circuit_final.zkey" "${VERIFY_KEY_PATH}"
-snarkjs groth16 prove "${PROOF_DIR}/circuit_final.zkey" "${PROOF_DIR}/witness.wtns" "${PROOF_PATH}" "${PUBLIC_PATH}"
+ng16_snarkjs groth16 setup "${PROOF_DIR}/circuit.r1cs" "${PTAU_FINAL}" "${PROOF_DIR}/circuit_0000.zkey"
+ng16_snarkjs zkey contribute "${PROOF_DIR}/circuit_0000.zkey" "${PROOF_DIR}/circuit_final.zkey" --name="local" -e="local deterministic entropy"
+ng16_snarkjs zkey export verificationkey "${PROOF_DIR}/circuit_final.zkey" "${VERIFY_KEY_PATH}"
+ng16_snarkjs groth16 prove "${PROOF_DIR}/circuit_final.zkey" "${PROOF_DIR}/witness.wtns" "${PROOF_PATH}" "${PUBLIC_PATH}"
 
-VERIFY_OUTPUT="$(snarkjs groth16 verify "${VERIFY_KEY_PATH}" "${PUBLIC_PATH}" "${PROOF_PATH}")"
+VERIFY_OUTPUT="$(ng16_snarkjs groth16 verify "${VERIFY_KEY_PATH}" "${PUBLIC_PATH}" "${PROOF_PATH}")"
 printf '%s\n' "${VERIFY_OUTPUT}"
 if [[ "${VERIFY_OUTPUT}" != *"OK"* && "${VERIFY_OUTPUT}" != *"ok"* ]]; then
   ng16_error "verification did not report success."

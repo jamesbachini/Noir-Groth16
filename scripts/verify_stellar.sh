@@ -29,10 +29,6 @@ fi
 # shellcheck source=./lib/common.sh
 source "${COMMON_SH}"
 
-snarkjs() {
-  ng16_snarkjs "$@"
-}
-
 run_converter() {
   local mode="$1"
   local input_path="$2"
@@ -89,7 +85,7 @@ ng16_require_file "${LOCAL_PUBLIC_PATH}"
 ng16_require_file "${LOCAL_PROOF_PATH}"
 
 echo "[2/7] Re-checking proof locally with snarkjs before deploy"
-LOCAL_VERIFY_OUTPUT="$(snarkjs groth16 verify "${LOCAL_VERIFY_KEY_PATH}" "${LOCAL_PUBLIC_PATH}" "${LOCAL_PROOF_PATH}")"
+LOCAL_VERIFY_OUTPUT="$(ng16_snarkjs groth16 verify "${LOCAL_VERIFY_KEY_PATH}" "${LOCAL_PUBLIC_PATH}" "${LOCAL_PROOF_PATH}")"
 printf '%s\n' "${LOCAL_VERIFY_OUTPUT}"
 if [[ "${LOCAL_VERIFY_OUTPUT}" != *"OK"* && "${LOCAL_VERIFY_OUTPUT}" != *"ok"* ]]; then
   ng16_error "local snarkjs verification did not report success."
