@@ -2,7 +2,9 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl,
-    crypto::bls12_381::{Fr, G1Affine, G2Affine, G1_SERIALIZED_SIZE, G2_SERIALIZED_SIZE},
+    crypto::bn254::{
+        Bn254G1Affine, Bn254G2Affine, Fr, BN254_G1_SERIALIZED_SIZE, BN254_G2_SERIALIZED_SIZE,
+    },
     symbol_short, vec, Bytes, Env, Symbol, Vec, U256,
 };
 
@@ -20,18 +22,18 @@ pub enum VerifierError {
 
 #[derive(Clone)]
 struct VerificationKey {
-    alpha: G1Affine,
-    beta: G2Affine,
-    gamma: G2Affine,
-    delta: G2Affine,
-    ic: Vec<G1Affine>,
+    alpha: Bn254G1Affine,
+    beta: Bn254G2Affine,
+    gamma: Bn254G2Affine,
+    delta: Bn254G2Affine,
+    ic: Vec<Bn254G1Affine>,
 }
 
 #[derive(Clone)]
 struct Proof {
-    a: G1Affine,
-    b: G2Affine,
-    c: G1Affine,
+    a: Bn254G1Affine,
+    b: Bn254G2Affine,
+    c: Bn254G1Affine,
 }
 
 #[derive(Clone)]
@@ -59,21 +61,37 @@ impl VerificationKey {
     fn from_bytes(env: &Env, bytes: &Bytes) -> Result<Self, VerifierError> {
         let mut pos = 0u32;
 
-        let alpha = G1Affine::from_array(
+        let alpha = Bn254G1Affine::from_array(
             env,
-            &take::<G1_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedVerifyingKey)?,
+            &take::<BN254_G1_SERIALIZED_SIZE>(
+                bytes,
+                &mut pos,
+                VerifierError::MalformedVerifyingKey,
+            )?,
         );
-        let beta = G2Affine::from_array(
+        let beta = Bn254G2Affine::from_array(
             env,
-            &take::<G2_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedVerifyingKey)?,
+            &take::<BN254_G2_SERIALIZED_SIZE>(
+                bytes,
+                &mut pos,
+                VerifierError::MalformedVerifyingKey,
+            )?,
         );
-        let gamma = G2Affine::from_array(
+        let gamma = Bn254G2Affine::from_array(
             env,
-            &take::<G2_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedVerifyingKey)?,
+            &take::<BN254_G2_SERIALIZED_SIZE>(
+                bytes,
+                &mut pos,
+                VerifierError::MalformedVerifyingKey,
+            )?,
         );
-        let delta = G2Affine::from_array(
+        let delta = Bn254G2Affine::from_array(
             env,
-            &take::<G2_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedVerifyingKey)?,
+            &take::<BN254_G2_SERIALIZED_SIZE>(
+                bytes,
+                &mut pos,
+                VerifierError::MalformedVerifyingKey,
+            )?,
         );
 
         let ic_len_bytes = take::<4>(bytes, &mut pos, VerifierError::MalformedVerifyingKey)?;
@@ -81,9 +99,13 @@ impl VerificationKey {
         let mut ic = Vec::new(env);
 
         for _ in 0..ic_len {
-            let g1 = G1Affine::from_array(
+            let g1 = Bn254G1Affine::from_array(
                 env,
-                &take::<G1_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedVerifyingKey)?,
+                &take::<BN254_G1_SERIALIZED_SIZE>(
+                    bytes,
+                    &mut pos,
+                    VerifierError::MalformedVerifyingKey,
+                )?,
             );
             ic.push_back(g1);
         }
@@ -106,17 +128,17 @@ impl Proof {
     fn from_bytes(env: &Env, bytes: &Bytes) -> Result<Self, VerifierError> {
         let mut pos = 0u32;
 
-        let a = G1Affine::from_array(
+        let a = Bn254G1Affine::from_array(
             env,
-            &take::<G1_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedProof)?,
+            &take::<BN254_G1_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedProof)?,
         );
-        let b = G2Affine::from_array(
+        let b = Bn254G2Affine::from_array(
             env,
-            &take::<G2_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedProof)?,
+            &take::<BN254_G2_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedProof)?,
         );
-        let c = G1Affine::from_array(
+        let c = Bn254G1Affine::from_array(
             env,
-            &take::<G1_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedProof)?,
+            &take::<BN254_G1_SERIALIZED_SIZE>(bytes, &mut pos, VerifierError::MalformedProof)?,
         );
 
         if pos != bytes.len() {
@@ -159,19 +181,19 @@ fn verify_proof(
         return Err(VerifierError::MalformedVerifyingKey);
     }
 
-    let bls = env.crypto().bls12_381();
+    let bn = env.crypto().bn254();
 
     let mut vk_x = vk.ic.get(0).unwrap();
     for (s, v) in pub_signals.iter().zip(vk.ic.iter().skip(1)) {
-        let prod = bls.g1_mul(&v, &s);
-        vk_x = bls.g1_add(&vk_x, &prod);
+        let prod = bn.g1_mul(&v, &s);
+        vk_x = bn.g1_add(&vk_x, &prod);
     }
 
     let neg_a = -proof.a;
     let vp1 = vec![env, neg_a, vk.alpha, vk_x, proof.c];
     let vp2 = vec![env, proof.b, vk.beta, vk.gamma, vk.delta];
 
-    Ok(bls.pairing_check(vp1, vp2))
+    Ok(bn.pairing_check(vp1, vp2))
 }
 
 #[contract]
