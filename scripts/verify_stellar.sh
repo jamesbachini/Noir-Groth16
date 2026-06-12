@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMMON_SH="${ROOT_DIR}/scripts/lib/common.sh"
 NETWORK="${NETWORK:-testnet}"
 SOURCE_ACCOUNT="${SOURCE_ACCOUNT:-${STELLAR_ACCOUNT:-}}"
+INVOKE_SEND="${INVOKE_SEND:-yes}"
 RUN_CIRCUIT_SCRIPT="${ROOT_DIR}/scripts/run_circuit.sh"
 CONTRACTS_DIR="${ROOT_DIR}/contracts"
 OUT_DIR="${OUT_DIR:-${ROOT_DIR}/target/groth16}"
@@ -175,16 +176,16 @@ PROOF_HEX="$(tr -d '\r\n' < "${BUILD_DIR}/proof.hex")"
 PUBLIC_HEX="$(tr -d '\r\n' < "${BUILD_DIR}/public.hex")"
 
 echo "[6/7] Storing verification key in contract"
-set_vk_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" -- set_vk --vk_bytes "${VK_HEX}")
+set_vk_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" --send "${INVOKE_SEND}" -- set_vk --vk_bytes "${VK_HEX}")
 if [[ -n "${SOURCE_ACCOUNT:-}" ]]; then
-  set_vk_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" --source "${SOURCE_ACCOUNT}" -- set_vk --vk_bytes "${VK_HEX}")
+  set_vk_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" --source "${SOURCE_ACCOUNT}" --send "${INVOKE_SEND}" -- set_vk --vk_bytes "${VK_HEX}")
 fi
 "${set_vk_cmd[@]}" >/dev/null
 
 echo "[7/7] Verifying proof on-chain"
-verify_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" -- verify --proof_bytes "${PROOF_HEX}" --pub_signals_bytes "${PUBLIC_HEX}")
+verify_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" --send "${INVOKE_SEND}" -- verify --proof_bytes "${PROOF_HEX}" --pub_signals_bytes "${PUBLIC_HEX}")
 if [[ -n "${SOURCE_ACCOUNT:-}" ]]; then
-  verify_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" --source "${SOURCE_ACCOUNT}" -- verify --proof_bytes "${PROOF_HEX}" --pub_signals_bytes "${PUBLIC_HEX}")
+  verify_cmd=(stellar contract invoke --id "${CONTRACT_ID}" --network "${NETWORK}" --source "${SOURCE_ACCOUNT}" --send "${INVOKE_SEND}" -- verify --proof_bytes "${PROOF_HEX}" --pub_signals_bytes "${PUBLIC_HEX}")
 fi
 VERIFY_RESULT="$("${verify_cmd[@]}")"
 echo "On-chain verification result: ${VERIFY_RESULT}"
