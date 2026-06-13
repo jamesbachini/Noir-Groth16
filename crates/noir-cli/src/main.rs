@@ -184,6 +184,7 @@ fn interop_cmd(
         .with_context(|| format!("failed reading inputs `{}`", inputs_path.display()))?;
     let inputs_json: serde_json::Value =
         serde_json::from_str(&inputs).context("invalid inputs json")?;
+    let inputs_json = filter_inputs_to_abi(&artifact, inputs_json)?;
 
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed creating output dir `{}`", out_dir.display()))?;
@@ -203,7 +204,13 @@ fn interop_cmd(
     .context("failed compiling R1CS")?;
     witness.witness_vector = system
         .materialize_witness(&witness.witness_vector)
-        .ok_or_else(|| anyhow!("failed materializing witness for {} wires", system.n_wires))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "failed materializing witness for {} wires: {}",
+                system.n_wires,
+                system.materialize_witness_failure_summary(&witness.witness_vector)
+            )
+        })?;
 
     let r1cs_path = out_dir.join("circuit.r1cs");
     let wtns_path = out_dir.join("witness.wtns");
@@ -220,6 +227,22 @@ fn interop_cmd(
         witness.witness_vector.len()
     );
     Ok(())
+}
+
+fn filter_inputs_to_abi(
+    artifact: &Artifact,
+    inputs: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let input_obj = inputs
+        .as_object()
+        .ok_or_else(|| anyhow!("inputs json must be an object"))?;
+    let mut filtered = serde_json::Map::new();
+    for param in &artifact.abi.parameters {
+        if let Some(value) = input_obj.get(&param.name) {
+            filtered.insert(param.name.clone(), value.clone());
+        }
+    }
+    Ok(serde_json::Value::Object(filtered))
 }
 
 fn compile_r1cs_for_command(

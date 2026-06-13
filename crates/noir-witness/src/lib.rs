@@ -550,11 +550,10 @@ fn flatten_value_for_param(
 
 fn flatten_value_for_type(typ: &AbiType, value: &Value) -> Result<Vec<FieldElement>, WitnessError> {
     match typ.kind.as_str() {
-        "field" | "integer" => Ok(vec![parse_field(value)?]),
+        "field" => Ok(vec![parse_field(value)?]),
+        "integer" => Ok(vec![parse_integer(typ, value)?]),
         "boolean" => {
-            let b = value.as_bool().ok_or_else(|| {
-                WitnessError::InvalidFieldValue(format!("expected bool, got {value}"))
-            })?;
+            let b = parse_bool(value)?;
             Ok(vec![FieldElement::from(b)])
         }
         "string" => {
@@ -705,6 +704,129 @@ fn parse_field(value: &Value) -> Result<FieldElement, WitnessError> {
             .ok_or_else(|| WitnessError::InvalidFieldValue(s.to_string()));
     }
 
+    Err(WitnessError::InvalidFieldValue(value.to_string()))
+}
+
+fn parse_bool(value: &Value) -> Result<bool, WitnessError> {
+    if let Some(v) = value.as_bool() {
+        return Ok(v);
+    }
+    if let Some(v) = value.as_u64() {
+        return match v {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WitnessError::InvalidFieldValue(value.to_string())),
+        };
+    }
+    if let Some(v) = value.as_i64() {
+        return match v {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WitnessError::InvalidFieldValue(value.to_string())),
+        };
+    }
+    if let Some(s) = value.as_str() {
+        return match s {
+            "false" | "False" | "FALSE" | "0" => Ok(false),
+            "true" | "True" | "TRUE" | "1" => Ok(true),
+            _ => Err(WitnessError::InvalidFieldValue(s.to_string())),
+        };
+    }
+    Err(WitnessError::InvalidFieldValue(value.to_string()))
+}
+
+fn parse_integer(typ: &AbiType, value: &Value) -> Result<FieldElement, WitnessError> {
+    let sign = typ
+        .extra
+        .get("sign")
+        .and_then(Value::as_str)
+        .unwrap_or("unsigned");
+    let width = typ
+        .extra
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or(FieldElement::max_num_bits() as u64);
+
+    if sign != "signed" {
+        return parse_unsigned_integer(width, value);
+    }
+
+    if width == 0 || width > 128 {
+        return Err(WitnessError::UnsupportedAbiType(format!(
+            "signed integer width {width} is unsupported"
+        )));
+    }
+
+    let parsed = parse_i128(value)?;
+    let (min, max) = if width == 128 {
+        (i128::MIN, i128::MAX)
+    } else {
+        (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
+    };
+    if parsed < min || parsed > max {
+        return Err(WitnessError::InvalidFieldValue(value.to_string()));
+    }
+
+    let encoded = if parsed < 0 {
+        if width == 128 {
+            parsed as u128
+        } else {
+            (1u128 << width) - parsed.unsigned_abs()
+        }
+    } else {
+        parsed as u128
+    };
+    Ok(FieldElement::from(encoded))
+}
+
+fn parse_unsigned_integer(width: u64, value: &Value) -> Result<FieldElement, WitnessError> {
+    if width > 128 {
+        return parse_field(value);
+    }
+    let parsed = parse_u128(value)?;
+    if width < 128 && parsed >= (1u128 << width) {
+        return Err(WitnessError::InvalidFieldValue(value.to_string()));
+    }
+    Ok(FieldElement::from(parsed))
+}
+
+fn parse_i128(value: &Value) -> Result<i128, WitnessError> {
+    if let Some(v) = value.as_i64() {
+        return Ok(v as i128);
+    }
+    if let Some(v) = value.as_u64() {
+        return Ok(v as i128);
+    }
+    if let Some(s) = value.as_str() {
+        return s
+            .parse::<i128>()
+            .map_err(|_| WitnessError::InvalidFieldValue(s.to_string()));
+    }
+    Err(WitnessError::InvalidFieldValue(value.to_string()))
+}
+
+fn parse_u128(value: &Value) -> Result<u128, WitnessError> {
+    if let Some(v) = value.as_u64() {
+        return Ok(v as u128);
+    }
+    if let Some(v) = value.as_i64() {
+        if v < 0 {
+            return Err(WitnessError::InvalidFieldValue(value.to_string()));
+        }
+        return Ok(v as u128);
+    }
+    if let Some(v) = value.as_bool() {
+        return Ok(u128::from(v));
+    }
+    if let Some(s) = value.as_str() {
+        if let Some(hex) = s.strip_prefix("0x") {
+            return u128::from_str_radix(hex, 16)
+                .map_err(|_| WitnessError::InvalidFieldValue(s.to_string()));
+        }
+        return s
+            .parse::<u128>()
+            .map_err(|_| WitnessError::InvalidFieldValue(s.to_string()));
+    }
     Err(WitnessError::InvalidFieldValue(value.to_string()))
 }
 
@@ -1016,6 +1138,37 @@ mod tests {
 
         let err = generate_witness(&artifact, &inputs).expect_err("unexpected input should fail");
         assert!(matches!(err, WitnessError::UnexpectedInput(name) if name == "z"));
+    }
+
+    #[test]
+    fn parses_boolean_strings_and_numbers() {
+        assert!(!parse_bool(&serde_json::json!("0")).expect("0 should parse as false"));
+        assert!(parse_bool(&serde_json::json!("1")).expect("1 should parse as true"));
+        assert!(!parse_bool(&serde_json::json!(0)).expect("0 should parse as false"));
+        assert!(parse_bool(&serde_json::json!(1)).expect("1 should parse as true"));
+        assert!(parse_bool(&serde_json::json!(true)).expect("bool should parse"));
+        assert!(parse_bool(&serde_json::json!("2")).is_err());
+    }
+
+    #[test]
+    fn parses_signed_integer_as_twos_complement_field_value() {
+        let int_type: AbiType = serde_json::from_value(serde_json::json!({
+            "kind": "integer",
+            "sign": "signed",
+            "width": 8
+        }))
+        .expect("integer type should parse");
+
+        assert_eq!(
+            parse_integer(&int_type, &serde_json::json!("-86")).expect("negative i8 should parse"),
+            FieldElement::from(170u128)
+        );
+        assert_eq!(
+            parse_integer(&int_type, &serde_json::json!("42")).expect("positive i8 should parse"),
+            FieldElement::from(42u128)
+        );
+        assert!(parse_integer(&int_type, &serde_json::json!("-129")).is_err());
+        assert!(parse_integer(&int_type, &serde_json::json!("128")).is_err());
     }
 
     #[test]

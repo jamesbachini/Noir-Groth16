@@ -1,0 +1,8 @@
+[package]
+name = "basic"
+type = "bin"
+authors = [""]
+compiler_version = ">=0.22.0"
+
+[dependencies]
+noir_native_sha256 = { path = "../../noir-native-sha256" }

@@ -1,0 +1,134 @@
+use commitment::hash_salt_country_tbs;
+use fragmented_sig_check_rsa::verify_rsa_signature;
+use partial_sha256::{
+    commit_to_data_chunk, sha256_continue, sha256_finalize, SHA256State,
+    verify_sha256_state_and_data_commitment,
+};
+use sig_check_rsa::compute_key_ne_hash;
+use utils::check_zero_padding;
+use utils::get_asn1_element_length;
+use utils::types::{Alpha3CountryCode, SHA256Digest};
+
+global CHUNK1_SIZE: u32 = 640;
+global CHUNK2_SIZE: u32 = 640;
+global TBS_CERT_SIZE: u32 = 1300;
+
+fn main(
+    comm_in: pub Field,
+    csc_pubkey: pub [u8; 512],
+    csc_key_ne_hash: pub Field,
+    csc_pubkey_redc_param: [u8; 513],
+    salt: Field,
+    country: Alpha3CountryCode,
+    state1: SHA256State,
+    tbs_certificate: [u8; TBS_CERT_SIZE],
+    tbs_certificate_len: u32,
+    dsc_signature: [u8; 512],
+    exponent: u32,
+    salt_out: Field,
+) -> pub Field {
+    // Validate tbs_certificate_len bounds
+    assert(
+        tbs_certificate_len <= TBS_CERT_SIZE,
+        "tbs_certificate_len must not exceed TBS_CERT_SIZE (1300)",
+    );
+
+    // Validate prover-supplied tbs_certificate_len against ASN.1 DER header
+    assert(tbs_certificate[0] == 0x30, "TBS must start with SEQUENCE tag");
+    let computed_len = get_asn1_element_length(tbs_certificate);
+    assert(tbs_certificate_len == computed_len, "tbs_certificate_len does not match ASN.1 header");
+
+    // Ensure all bytes beyond the signed length are zero so that trailing
+    // bytes cannot carry attacker-controlled data into the commitment.
+    check_zero_padding(tbs_certificate, tbs_certificate_len);
+    assert(
+        csc_key_ne_hash == compute_key_ne_hash::<512>(csc_pubkey, exponent),
+        "CSC key hash does not match (n||e)",
+    );
+
+    let mut chunk1: [u8; CHUNK1_SIZE] = [0; CHUNK1_SIZE];
+    for i in 0..CHUNK1_SIZE {
+        chunk1[i] = tbs_certificate[i];
+    }
+
+    let data_comm1 = commit_to_data_chunk(salt, chunk1);
+    verify_sha256_state_and_data_commitment(comm_in, salt, state1, CHUNK1_SIZE, data_comm1);
+
+    let remaining_size: u32 = if tbs_certificate_len > CHUNK1_SIZE {
+        tbs_certificate_len - CHUNK1_SIZE
+    } else {
+        0
+    };
+
+    let num_full_blocks = remaining_size / 64;
+    let full_block_bytes = num_full_blocks * 64;
+    let final_partial_bytes = remaining_size - full_block_bytes;
+
+    let mut chunk2: [u8; CHUNK2_SIZE] = [0; CHUNK2_SIZE];
+    for i in 0..CHUNK2_SIZE {
+        chunk2[i] = tbs_certificate[CHUNK1_SIZE + i];
+    }
+
+    let state2 = sha256_continue(state1, chunk2, full_block_bytes);
+
+    let mut final_block: [u8; 64] = [0; 64];
+    for i in 0..64 {
+        if i < final_partial_bytes {
+            final_block[i] = tbs_certificate[CHUNK1_SIZE + full_block_bytes + i];
+        }
+    }
+
+    let tbs_hash: SHA256Digest = sha256_finalize(
+        state2,
+        final_block,
+        final_partial_bytes,
+        tbs_certificate_len,
+    );
+
+    assert(
+        verify_rsa_signature::<512>(
+            csc_pubkey,
+            dsc_signature,
+            csc_pubkey_redc_param,
+            exponent,
+            tbs_hash,
+        ),
+        "RSA signature verification failed",
+    );
+
+    let comm_out = hash_salt_country_tbs(salt_out, country, tbs_certificate);
+
+    comm_out
+}
+
+/// A TBS buffer whose tail (bytes >= len) is all-zero must pass.
+#[test]
+fn test_zero_padding_passes_when_tail_is_all_zero() {
+    let mut tbs: [u8; TBS_CERT_SIZE] = [0; TBS_CERT_SIZE];
+    tbs[0] = 0x30;
+    tbs[1] = 0x82;
+    let len: u32 = 10;
+    check_zero_padding(tbs, len);
+}
+
+/// A single non-zero byte immediately after the declared length must be
+/// rejected.  This is the canonical one-byte smuggling attack.
+#[test(should_fail_with = "Failed constraint")]
+fn test_zero_padding_fails_when_nonzero_byte_in_unsigned_tail() {
+    let mut tbs: [u8; TBS_CERT_SIZE] = [0; TBS_CERT_SIZE];
+    tbs[0] = 0x30;
+    tbs[1] = 0x82;
+    let len: u32 = 10;
+    tbs[10] = 0x01;
+    check_zero_padding(tbs, len);
+}
+
+/// A non-zero byte at the very last byte of the 1300-byte buffer must be
+/// rejected regardless of how far it is from the signed region.
+#[test(should_fail_with = "Failed constraint")]
+fn test_zero_padding_fails_when_nonzero_byte_at_end_of_buffer() {
+    let mut tbs: [u8; TBS_CERT_SIZE] = [0; TBS_CERT_SIZE];
+    let len: u32 = 100;
+    tbs[TBS_CERT_SIZE - 1] = 0xFF;
+    check_zero_padding(tbs, len);
+}

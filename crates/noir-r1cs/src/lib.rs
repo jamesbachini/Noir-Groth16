@@ -105,6 +105,20 @@ pub struct SparseTerm {
 
 pub type SparseRow = Vec<SparseTerm>;
 
+#[derive(Clone, Debug)]
+struct Sha256AddModMaterializationPattern {
+    result_wire: usize,
+    carry_wire: usize,
+    terms: Vec<(usize, u128)>,
+    constant: u128,
+}
+
+#[derive(Clone, Debug)]
+struct BitDecompositionMaterializationPattern {
+    output_wire: usize,
+    bit_wires: Vec<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csSystem {
     pub n_wires: u32,
@@ -115,6 +129,8 @@ pub struct R1csSystem {
     pub a: Vec<SparseRow>,
     pub b: Vec<SparseRow>,
     pub c: Vec<SparseRow>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub derived_wire_values: BTreeMap<u32, FieldElement>,
 }
 
 type AcirProgram = Program<FieldElement>;
@@ -242,6 +258,7 @@ struct LoweringContext<'a> {
     memory_blocks: BTreeMap<u32, Vec<u32>>,
     pending_hint_outputs: Vec<PendingHintOutputConstraint>,
     unsupported: Vec<UnsupportedOpcodeInfo>,
+    derived_wire_values: BTreeMap<u32, FieldElement>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,6 +385,7 @@ impl<'a> LoweringContext<'a> {
             memory_blocks: BTreeMap::new(),
             pending_hint_outputs: Vec::new(),
             unsupported: Vec::new(),
+            derived_wire_values: BTreeMap::new(),
         }
     }
 
@@ -397,6 +415,7 @@ impl<'a> LoweringContext<'a> {
             a: self.a_rows,
             b: self.b_rows,
             c: self.c_rows,
+            derived_wire_values: self.derived_wire_values,
         })
     }
 
@@ -723,6 +742,9 @@ impl<'a> LoweringContext<'a> {
                 coeff: FieldElement::one(),
             }];
             self.constrained_wires.insert(lifted_product_wire);
+            if let Some(value) = self.evaluate_known_row(&original_c) {
+                self.assign_derived_wire(lifted_product_wire, value)?;
+            }
 
             let mut mismatch_terms = Vec::with_capacity(original_c.len() + 1);
             mismatch_terms.push(SparseTerm {
@@ -838,6 +860,12 @@ impl<'a> LoweringContext<'a> {
                     coeff: FieldElement::one(),
                 }],
             )?;
+            if let (Some(lhs), Some(rhs)) = (
+                self.known_wire_value(lhs_wire),
+                self.known_wire_value(rhs_wire),
+            ) {
+                self.assign_derived_wire(tmp_wire, lhs * rhs)?;
+            }
 
             add_linear(&mut linear_terms, tmp_wire, *coeff);
         }
@@ -1077,6 +1105,28 @@ impl<'a> LoweringContext<'a> {
             self.enforce_boolean_wire(selector)?;
             selector_wires.push(selector);
         }
+        if let Some(index) = self.known_wire_value(index_wire).and_then(field_to_usize) {
+            if index >= selector_wires.len() {
+                return Err(R1csError::InvalidProgramInvariant {
+                    details: format!(
+                        "MemoryOp index {index} is out of bounds for block {} with {} entries at opcode index {}",
+                        block_id.0,
+                        selector_wires.len(),
+                        opcode_index
+                    ),
+                });
+            }
+            for (position, selector_wire) in selector_wires.iter().copied().enumerate() {
+                self.assign_derived_wire(
+                    selector_wire,
+                    if position == index {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    },
+                )?;
+            }
+        }
 
         let mut selector_sum = Vec::with_capacity(selector_wires.len());
         for selector_wire in &selector_wires {
@@ -1133,6 +1183,12 @@ impl<'a> LoweringContext<'a> {
                     coeff: FieldElement::one(),
                 }],
             )?;
+            if let (Some(entry), Some(selector)) = (
+                self.known_wire_value(*entry_wire),
+                self.known_wire_value(*selector_wire),
+            ) {
+                self.assign_derived_wire(weighted_entry, entry * selector)?;
+            }
             weighted_old_entries.push(weighted_entry);
         }
 
@@ -1155,7 +1211,15 @@ impl<'a> LoweringContext<'a> {
                 coeff: FieldElement::one(),
             }],
         )?;
-
+        let selected_eval_terms = weighted_old_entries
+            .iter()
+            .map(|wire| (*wire, FieldElement::one()))
+            .collect::<Vec<_>>();
+        if let Some(value) =
+            self.evaluate_known_linear_combination(&selected_eval_terms, FieldElement::zero())
+        {
+            self.assign_derived_wire(selected_old_wire, value)?;
+        }
         // Enforce read semantics only when operation = 0:
         // (value - selected_old) * (1 - operation) = 0
         self.emit_constraint(
@@ -1199,7 +1263,12 @@ impl<'a> LoweringContext<'a> {
                     coeff: FieldElement::one(),
                 }],
             )?;
-
+            if let (Some(operation), Some(selector)) = (
+                self.known_wire_value(op_wire),
+                self.known_wire_value(*selector_wire),
+            ) {
+                self.assign_derived_wire(active_write, operation * selector)?;
+            }
             let delta_wire = self.allocate_intermediate_wire();
             let updated_entry = self.allocate_intermediate_wire();
             self.emit_constraint(
@@ -1242,7 +1311,6 @@ impl<'a> LoweringContext<'a> {
                     coeff: FieldElement::one(),
                 }],
             )?;
-
             new_entries.push(updated_entry);
         }
 
@@ -1294,6 +1362,12 @@ impl<'a> LoweringContext<'a> {
                     coeff: FieldElement::one(),
                 }],
             )?;
+            if let (Some(lhs), Some(rhs)) = (
+                self.known_wire_value(lhs_wire),
+                self.known_wire_value(rhs_wire),
+            ) {
+                self.assign_derived_wire(tmp_wire, lhs * rhs)?;
+            }
 
             add_linear(&mut linear_terms, tmp_wire, *coeff);
         }
@@ -1308,6 +1382,10 @@ impl<'a> LoweringContext<'a> {
             add_linear(&mut linear_terms, 0, expr.q_c);
         }
 
+        let known_terms = linear_terms
+            .iter()
+            .map(|(wire, coeff)| (*wire, *coeff))
+            .collect::<Vec<_>>();
         self.emit_constraint(
             vec![SparseTerm {
                 wire: 0,
@@ -1329,7 +1407,14 @@ impl<'a> LoweringContext<'a> {
                 ),
             },
             other => other,
-        })
+        })?;
+        if let Some(value) =
+            self.evaluate_known_linear_combination(&known_terms, FieldElement::zero())
+        {
+            self.assign_derived_wire(target_wire, value)?;
+        }
+
+        Ok(())
     }
 
     fn enforce_boolean_wire(&mut self, wire: u32) -> Result<(), R1csError> {
@@ -2000,7 +2085,24 @@ impl<'a> LoweringContext<'a> {
         context: &str,
     ) -> Result<Sha256Word, R1csError> {
         let result_wire = self.allocate_intermediate_wire();
-        let result_bits = self.decompose_wire_to_bits(result_wire, 32, opcode_index, context)?;
+
+        let mut known_sum = u128::from(constant);
+        let mut all_operands_known = true;
+        for operand in operands {
+            if let Some(value) = self
+                .known_wire_value(*operand)
+                .and_then(|value| value.try_to_u32())
+            {
+                known_sum += u128::from(value);
+            } else {
+                all_operands_known = false;
+                break;
+            }
+        }
+        if all_operands_known {
+            let result = known_sum & ((1u128 << 32) - 1);
+            self.assign_derived_wire(result_wire, FieldElement::from(result))?;
+        }
 
         let mut carry_bound = operands.len();
         if constant != 0 {
@@ -2014,6 +2116,11 @@ impl<'a> LoweringContext<'a> {
         }
 
         let carry_wire = self.allocate_intermediate_wire();
+        if all_operands_known {
+            let carry = known_sum >> 32;
+            self.assign_derived_wire(carry_wire, FieldElement::from(carry))?;
+        }
+        let result_bits = self.decompose_wire_to_bits(result_wire, 32, opcode_index, context)?;
         let _ = self.decompose_wire_to_bits(carry_wire, carry_bits, opcode_index, context)?;
 
         let two_to_32 = FieldElement::from(1u128 << 32);
@@ -2100,6 +2207,21 @@ impl<'a> LoweringContext<'a> {
                 Vec::new(),
             )?;
             self.enforce_boolean_wire(output)?;
+            if let (Some(lhs), Some(rhs)) = (
+                self.known_wire_value(*lhs_bit),
+                self.known_wire_value(*rhs_bit),
+            ) {
+                let lhs_is_one = lhs.is_one();
+                let rhs_is_one = rhs.is_one();
+                self.assign_derived_wire(
+                    output,
+                    if lhs_is_one ^ rhs_is_one {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    },
+                )?;
+            }
             out.push(output);
         }
         Ok(out)
@@ -3888,6 +4010,12 @@ impl<'a> LoweringContext<'a> {
                 coeff: FieldElement::one(),
             }],
         )?;
+        if let (Some(lhs), Some(rhs)) = (
+            self.known_wire_value(lhs_wire),
+            self.known_wire_value(rhs_wire),
+        ) {
+            self.assign_derived_wire(output_wire, lhs * rhs)?;
+        }
         Ok(output_wire)
     }
 
@@ -3933,6 +4061,9 @@ impl<'a> LoweringContext<'a> {
                 coeff: FieldElement::one(),
             }],
         )?;
+        if let Some(value) = self.evaluate_known_linear_combination(terms, constant) {
+            self.assign_derived_wire(output_wire, value)?;
+        }
         Ok(output_wire)
     }
 
@@ -4528,6 +4659,22 @@ impl<'a> LoweringContext<'a> {
             self.enforce_boolean_wire(bit_wire)?;
             bits.push(bit_wire);
         }
+        if let Some(value) = self.known_wire_value(wire) {
+            for (bit_wire, bit) in bits
+                .iter()
+                .copied()
+                .zip(field_to_bits_le(value, num_bits as usize).into_iter())
+            {
+                self.assign_derived_wire(
+                    bit_wire,
+                    if bit {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    },
+                )?;
+            }
+        }
 
         let mut recomposition = Vec::with_capacity(bits.len());
         let mut coeff = FieldElement::one();
@@ -4619,6 +4766,59 @@ impl<'a> LoweringContext<'a> {
         self.next_wire += 1;
         self.allocated_intermediate_wires.insert(wire);
         wire
+    }
+
+    fn known_wire_value(&self, wire: u32) -> Option<FieldElement> {
+        if wire == 0 {
+            return Some(FieldElement::one());
+        }
+        if let Some(value) = self.derived_wire_values.get(&wire) {
+            return Some(*value);
+        }
+        let witness = self.instance_witness?;
+        witness.get(wire as usize).copied()
+    }
+
+    fn assign_derived_wire(&mut self, wire: u32, value: FieldElement) -> Result<(), R1csError> {
+        if wire == 0 {
+            if value.is_one() {
+                return Ok(());
+            }
+            return Err(R1csError::InvalidProgramInvariant {
+                details: "attempted to assign non-one value to constant wire".to_string(),
+            });
+        }
+        if let Some(existing) = self.known_wire_value(wire) {
+            if existing != value {
+                return Err(R1csError::InvalidProgramInvariant {
+                    details: format!(
+                        "conflicting derived value for wire {wire}: existing {existing}, new {value}"
+                    ),
+                });
+            }
+        }
+        self.derived_wire_values.insert(wire, value);
+        Ok(())
+    }
+
+    fn evaluate_known_linear_combination(
+        &self,
+        terms: &[(u32, FieldElement)],
+        constant: FieldElement,
+    ) -> Option<FieldElement> {
+        let mut acc = constant;
+        for (wire, coeff) in terms {
+            acc += *coeff * self.known_wire_value(*wire)?;
+        }
+        Some(acc)
+    }
+
+    fn evaluate_known_row(&self, row: &[SparseTerm]) -> Option<FieldElement> {
+        let mut acc = FieldElement::zero();
+        for term in row {
+            acc += term.coeff * self.known_wire_value(term.wire)?;
+        }
+        Some(acc)
     }
 
     fn allocate_virtual_witness(&mut self) -> Witness {
@@ -4897,19 +5097,56 @@ impl R1csSystem {
     }
 
     pub fn materialize_witness(&self, witness: &[FieldElement]) -> Option<Vec<FieldElement>> {
-        let mut full = vec![FieldElement::zero(); self.n_wires as usize];
-        let mut known = vec![false; self.n_wires as usize];
-        let copy_len = std::cmp::min(witness.len(), full.len());
-        full[..copy_len].copy_from_slice(&witness[..copy_len]);
-        for slot in known.iter_mut().take(copy_len) {
-            *slot = true;
+        self.materialize_witness_with_known(witness)
+            .map(|result| result.0)
+    }
+
+    pub fn materialize_witness_failure_summary(&self, witness: &[FieldElement]) -> String {
+        match self.materialize_witness_with_known(witness) {
+            Some(_) => "witness materializes successfully".to_string(),
+            None => {
+                let Some((full, known)) = self.materialize_witness_state(witness) else {
+                    return "derived wire assignment references out-of-range wire".to_string();
+                };
+                let unknown_count = known.iter().filter(|known| !**known).count();
+                let first_unknown = known
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, known)| (!*known).then_some(index))
+                    .map_or_else(|| "none".to_string(), |index| index.to_string());
+                let first_unsatisfied = self.first_unsatisfied_row(&full);
+                format!(
+                    "unknown_wires={unknown_count} first_unknown_wire={first_unknown} first_unsatisfied_row={first_unsatisfied}"
+                )
+            }
         }
-        if !full.is_empty() {
-            full[0] = FieldElement::one();
-            known[0] = true;
+    }
+
+    fn materialize_witness_with_known(
+        &self,
+        witness: &[FieldElement],
+    ) -> Option<(Vec<FieldElement>, Vec<bool>)> {
+        let (full, known) = self.materialize_witness_state(witness)?;
+
+        if !self.is_satisfied_with_full_witness(&full) {
+            return None;
+        }
+
+        Some((full, known))
+    }
+
+    fn materialize_witness_state(
+        &self,
+        witness: &[FieldElement],
+    ) -> Option<(Vec<FieldElement>, Vec<bool>)> {
+        let (mut full, mut known) = self.seed_materialization(witness)?;
+        if self.is_satisfied_with_full_witness(&full) {
+            return Some((full, known));
         }
 
         let boolean_wires = self.collect_boolean_wires();
+        let bit_decomposition_patterns = self.collect_bit_decomposition_patterns(&boolean_wires);
+        let sha256_add_mod_patterns = self.collect_sha256_add_mod_patterns();
 
         // ACIR witness vectors include only original witnesses. Intermediate wires introduced
         // by lowering can often be solved from a single R1CS row if all other terms are known.
@@ -4920,12 +5157,32 @@ impl R1csSystem {
                 break;
             }
             progress = false;
-            if self.populate_bit_decomposition_wires(&boolean_wires, &mut full, &mut known)? {
+
+            loop {
+                let mut special_progress = false;
+                if self.populate_sha256_add_mod_wires(
+                    &sha256_add_mod_patterns,
+                    &mut full,
+                    &mut known,
+                )? {
+                    special_progress = true;
+                }
+                if self.populate_bit_decomposition_wires(
+                    &bit_decomposition_patterns,
+                    &mut full,
+                    &mut known,
+                )? {
+                    special_progress = true;
+                }
+                if !special_progress {
+                    break;
+                }
                 progress = true;
             }
             if self.populate_selector_wires_from_one_hot_patterns(&mut full, &mut known)? {
                 progress = true;
             }
+
             for i in 0..self.n_constraints as usize {
                 let a = eval_linear_form(&self.a[i], &full, &known)?;
                 let b = eval_linear_form(&self.b[i], &full, &known)?;
@@ -4936,7 +5193,7 @@ impl R1csSystem {
                     let target = term.wire as usize;
                     if a.1.is_empty()
                         && b.1.is_empty()
-                        && target >= copy_len
+                        && target >= witness.len()
                         && target < full.len()
                         && !term.coeff.is_zero()
                     {
@@ -5062,11 +5319,54 @@ impl R1csSystem {
             }
         }
 
-        if !self.is_satisfied_with_full_witness(&full) {
-            return None;
-        }
+        Some((full, known))
+    }
 
-        Some(full)
+    fn seed_materialization(
+        &self,
+        witness: &[FieldElement],
+    ) -> Option<(Vec<FieldElement>, Vec<bool>)> {
+        let mut full = vec![FieldElement::zero(); self.n_wires as usize];
+        let mut known = vec![false; self.n_wires as usize];
+        let copy_len = std::cmp::min(witness.len(), full.len());
+        full[..copy_len].copy_from_slice(&witness[..copy_len]);
+        for slot in known.iter_mut().take(copy_len) {
+            *slot = true;
+        }
+        if !full.is_empty() {
+            full[0] = FieldElement::one();
+            known[0] = true;
+        }
+        for (wire, value) in &self.derived_wire_values {
+            let index = *wire as usize;
+            if index >= full.len() {
+                return None;
+            }
+            if known[index] && full[index] != *value {
+                return None;
+            }
+            full[index] = *value;
+            known[index] = true;
+        }
+        Some((full, known))
+    }
+
+    fn first_unsatisfied_row(&self, full_witness: &[FieldElement]) -> String {
+        for i in 0..self.n_constraints as usize {
+            let Some(left) = dot(&self.a[i], full_witness) else {
+                return format!("{i}: row references out-of-range wire");
+            };
+            let Some(right) = dot(&self.b[i], full_witness) else {
+                return format!("{i}: row references out-of-range wire");
+            };
+            let Some(out) = dot(&self.c[i], full_witness) else {
+                return format!("{i}: row references out-of-range wire");
+            };
+            if left * right != out {
+                return i.to_string();
+            }
+        }
+        "none".to_string()
     }
 
     fn is_satisfied_with_full_witness(&self, full_witness: &[FieldElement]) -> bool {
@@ -5099,32 +5399,26 @@ impl R1csSystem {
 
     fn populate_bit_decomposition_wires(
         &self,
-        boolean_wires: &BTreeSet<usize>,
+        patterns: &[BitDecompositionMaterializationPattern],
         witness: &mut [FieldElement],
         known: &mut [bool],
     ) -> Option<bool> {
-        let max_rounds = self.n_constraints as usize;
         let mut progress = true;
         let mut changed = false;
-        for _ in 0..max_rounds {
+        while progress {
             if !progress {
                 break;
             }
             progress = false;
 
-            for i in 0..self.n_constraints as usize {
-                let Some((output_wire, bit_wires)) =
-                    bit_decomposition_pattern(&self.a[i], &self.b[i], &self.c[i], boolean_wires)
-                else {
-                    continue;
-                };
-
-                if output_wire >= witness.len() || !known[output_wire] {
+            for pattern in patterns {
+                if pattern.output_wire >= witness.len() || !known[pattern.output_wire] {
                     continue;
                 }
 
-                let output_bits = field_to_bits_le(witness[output_wire], bit_wires.len());
-                for (bit_wire, bit) in bit_wires.iter().zip(output_bits.into_iter()) {
+                let output_bits =
+                    field_to_bits_le(witness[pattern.output_wire], pattern.bit_wires.len());
+                for (bit_wire, bit) in pattern.bit_wires.iter().zip(output_bits.into_iter()) {
                     if *bit_wire >= witness.len() || *bit_wire >= known.len() {
                         return None;
                     }
@@ -5148,6 +5442,24 @@ impl R1csSystem {
         }
 
         Some(changed)
+    }
+
+    fn collect_bit_decomposition_patterns(
+        &self,
+        boolean_wires: &BTreeSet<usize>,
+    ) -> Vec<BitDecompositionMaterializationPattern> {
+        let mut patterns = Vec::new();
+        for i in 0..self.n_constraints as usize {
+            if let Some((output_wire, bit_wires)) =
+                bit_decomposition_pattern(&self.a[i], &self.b[i], &self.c[i], boolean_wires)
+            {
+                patterns.push(BitDecompositionMaterializationPattern {
+                    output_wire,
+                    bit_wires,
+                });
+            }
+        }
+        patterns
     }
 
     fn populate_selector_wires_from_one_hot_patterns(
@@ -5217,6 +5529,76 @@ impl R1csSystem {
         }
 
         Some(changed)
+    }
+
+    fn populate_sha256_add_mod_wires(
+        &self,
+        patterns: &[Sha256AddModMaterializationPattern],
+        witness: &mut [FieldElement],
+        known: &mut [bool],
+    ) -> Option<bool> {
+        let mut changed = false;
+        for pattern in patterns {
+            let result_wire = pattern.result_wire;
+            let carry_wire = pattern.carry_wire;
+
+            if result_wire >= witness.len()
+                || result_wire >= known.len()
+                || carry_wire >= witness.len()
+                || carry_wire >= known.len()
+            {
+                return None;
+            }
+
+            let mut known_sum = pattern.constant;
+            let mut all_terms_known = true;
+            for (wire, coeff) in &pattern.terms {
+                if *wire >= witness.len() || *wire >= known.len() || !known[*wire] {
+                    all_terms_known = false;
+                    break;
+                }
+                let value = u128::from(witness[*wire].try_to_u32()?);
+                known_sum = known_sum.checked_add(coeff.checked_mul(value)?)?;
+            }
+            if !all_terms_known {
+                continue;
+            }
+
+            let result = FieldElement::from(known_sum & ((1u128 << 32) - 1));
+            let carry = FieldElement::from(known_sum >> 32);
+
+            if known[result_wire] {
+                if witness[result_wire] != result {
+                    return None;
+                }
+            } else {
+                witness[result_wire] = result;
+                known[result_wire] = true;
+                changed = true;
+            }
+
+            if known[carry_wire] {
+                if witness[carry_wire] != carry {
+                    return None;
+                }
+            } else {
+                witness[carry_wire] = carry;
+                known[carry_wire] = true;
+                changed = true;
+            }
+        }
+
+        Some(changed)
+    }
+
+    fn collect_sha256_add_mod_patterns(&self) -> Vec<Sha256AddModMaterializationPattern> {
+        let mut patterns = Vec::new();
+        for i in 0..self.n_constraints as usize {
+            if let Some(pattern) = sha256_add_mod_pattern(&self.a[i], &self.b[i], &self.c[i]) {
+                patterns.push(pattern);
+            }
+        }
+        patterns
     }
 }
 
@@ -5311,6 +5693,62 @@ fn field_to_bits_le(value: FieldElement, num_bits: usize) -> Vec<bool> {
     bits
 }
 
+fn sha256_add_mod_pattern(
+    a_row: &SparseRow,
+    b_row: &SparseRow,
+    c_row: &SparseRow,
+) -> Option<Sha256AddModMaterializationPattern> {
+    if a_row.len() != 1
+        || a_row[0].wire != 0
+        || !a_row[0].coeff.is_one()
+        || !c_row.is_empty()
+        || b_row.len() < 3
+    {
+        return None;
+    }
+
+    let minus_one = -FieldElement::one();
+    let minus_two_to_32 = -FieldElement::from(1u128 << 32);
+    let mut result_wire = None;
+    let mut carry_wire = None;
+    let mut terms = Vec::new();
+    let mut constant = 0u128;
+
+    for term in b_row {
+        if term.wire == 0 {
+            constant = constant.checked_add(field_to_u128(term.coeff)?)?;
+            continue;
+        }
+
+        let wire = term.wire as usize;
+        if term.coeff == minus_one {
+            if result_wire.replace(wire).is_some() {
+                return None;
+            }
+            continue;
+        }
+        if term.coeff == minus_two_to_32 {
+            if carry_wire.replace(wire).is_some() {
+                return None;
+            }
+            continue;
+        }
+
+        let coeff = field_to_u128(term.coeff)?;
+        if coeff == 0 || coeff > 16 {
+            return None;
+        }
+        terms.push((wire, coeff));
+    }
+
+    Some(Sha256AddModMaterializationPattern {
+        result_wire: result_wire?,
+        carry_wire: carry_wire?,
+        terms,
+        constant,
+    })
+}
+
 fn selector_sum_pattern(
     a_row: &SparseRow,
     b_row: &SparseRow,
@@ -5403,6 +5841,22 @@ fn field_to_usize(value: FieldElement) -> Option<usize> {
         out = out.checked_add(byte as usize)?;
     }
     Some(out)
+}
+
+fn field_to_u128(value: FieldElement) -> Option<u128> {
+    let bytes = value.to_be_bytes();
+    if bytes.len() > 16 {
+        let split = bytes.len() - 16;
+        if bytes[..split].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        return Some(u128::from_be_bytes(bytes[split..].try_into().ok()?));
+    }
+
+    let mut padded = [0u8; 16];
+    let offset = 16 - bytes.len();
+    padded[offset..].copy_from_slice(&bytes);
+    Some(u128::from_be_bytes(padded))
 }
 
 fn eval_linear_form(
@@ -6083,6 +6537,7 @@ mod tests {
                 coeff: FieldElement::one(),
             }]],
             c: vec![Vec::new()],
+            derived_wire_values: BTreeMap::new(),
         };
 
         assert!(!system.is_satisfied(&[FieldElement::one(), FieldElement::one()]));
