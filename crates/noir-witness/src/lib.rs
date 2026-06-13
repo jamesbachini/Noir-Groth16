@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Write,
+    io::{BufWriter, Write},
     path::Path,
 };
 
@@ -151,7 +151,7 @@ impl WitnessArtifacts {
 
         let file =
             WtnsFile::<32>::from_vec(witness, WtnsFieldElement::from(bn254_modulus_le_bytes()));
-        let mut output = std::fs::File::create(path)?;
+        let mut output = BufWriter::new(std::fs::File::create(path)?);
         file.write(&mut output)?;
         output.flush()?;
         Ok(())

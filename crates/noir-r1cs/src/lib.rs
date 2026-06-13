@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Write,
+    io::{BufWriter, Write},
     path::Path,
 };
 
@@ -120,6 +120,20 @@ struct BitDecompositionMaterializationPattern {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryOpMaterializationPattern {
+    operation_wire: usize,
+    index_wire: usize,
+    value_wire: usize,
+    entry_wires: Vec<usize>,
+    selector_wires: Vec<usize>,
+    weighted_entry_wires: Vec<usize>,
+    selected_old_wire: usize,
+    active_write_wires: Vec<usize>,
+    delta_wires: Vec<usize>,
+    updated_entry_wires: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct R1csSystem {
     pub n_wires: u32,
     pub n_constraints: u32,
@@ -131,6 +145,10 @@ pub struct R1csSystem {
     pub c: Vec<SparseRow>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub derived_wire_values: BTreeMap<u32, FieldElement>,
+    #[serde(default, skip)]
+    pub memory_op_materialization_patterns: Vec<MemoryOpMaterializationPattern>,
+    #[serde(default, skip)]
+    pub memory_op_materialization_patterns_recorded: bool,
 }
 
 type AcirProgram = Program<FieldElement>;
@@ -231,7 +249,7 @@ pub fn write_r1cs_binary(system: &R1csSystem, path: impl AsRef<Path>) -> Result<
         map: WireMap((0..system.n_wires as u64).collect()),
     };
 
-    let mut out = std::fs::File::create(path)?;
+    let mut out = BufWriter::new(std::fs::File::create(path)?);
     file.write(&mut out)?;
     out.flush()?;
     Ok(())
@@ -256,6 +274,7 @@ struct LoweringContext<'a> {
     b_rows: Vec<SparseRow>,
     c_rows: Vec<SparseRow>,
     memory_blocks: BTreeMap<u32, Vec<u32>>,
+    memory_op_materialization_patterns: Vec<MemoryOpMaterializationPattern>,
     pending_hint_outputs: Vec<PendingHintOutputConstraint>,
     unsupported: Vec<UnsupportedOpcodeInfo>,
     derived_wire_values: BTreeMap<u32, FieldElement>,
@@ -383,6 +402,7 @@ impl<'a> LoweringContext<'a> {
             b_rows: Vec::new(),
             c_rows: Vec::new(),
             memory_blocks: BTreeMap::new(),
+            memory_op_materialization_patterns: Vec::new(),
             pending_hint_outputs: Vec::new(),
             unsupported: Vec::new(),
             derived_wire_values: BTreeMap::new(),
@@ -416,6 +436,8 @@ impl<'a> LoweringContext<'a> {
             b: self.b_rows,
             c: self.c_rows,
             derived_wire_values: self.derived_wire_values,
+            memory_op_materialization_patterns: self.memory_op_materialization_patterns,
+            memory_op_materialization_patterns_recorded: true,
         })
     }
 
@@ -1247,6 +1269,8 @@ impl<'a> LoweringContext<'a> {
         )?;
 
         let mut new_entries = Vec::with_capacity(entries.len());
+        let mut active_write_wires = Vec::with_capacity(entries.len());
+        let mut delta_wires = Vec::with_capacity(entries.len());
         for (entry_wire, selector_wire) in entries.iter().zip(selector_wires.iter()) {
             let active_write = self.allocate_intermediate_wire();
             self.emit_constraint(
@@ -1263,6 +1287,7 @@ impl<'a> LoweringContext<'a> {
                     coeff: FieldElement::one(),
                 }],
             )?;
+            active_write_wires.push(active_write);
             if let (Some(operation), Some(selector)) = (
                 self.known_wire_value(op_wire),
                 self.known_wire_value(*selector_wire),
@@ -1271,6 +1296,7 @@ impl<'a> LoweringContext<'a> {
             }
             let delta_wire = self.allocate_intermediate_wire();
             let updated_entry = self.allocate_intermediate_wire();
+            delta_wires.push(delta_wire);
             self.emit_constraint(
                 vec![SparseTerm {
                     wire: active_write,
@@ -1314,6 +1340,25 @@ impl<'a> LoweringContext<'a> {
             new_entries.push(updated_entry);
         }
 
+        self.memory_op_materialization_patterns
+            .push(MemoryOpMaterializationPattern {
+                operation_wire: op_wire as usize,
+                index_wire: index_wire as usize,
+                value_wire: value_wire as usize,
+                entry_wires: entries.iter().map(|wire| *wire as usize).collect(),
+                selector_wires: selector_wires.iter().map(|wire| *wire as usize).collect(),
+                weighted_entry_wires: weighted_old_entries
+                    .iter()
+                    .map(|wire| *wire as usize)
+                    .collect(),
+                selected_old_wire: selected_old_wire as usize,
+                active_write_wires: active_write_wires
+                    .iter()
+                    .map(|wire| *wire as usize)
+                    .collect(),
+                delta_wires: delta_wires.iter().map(|wire| *wire as usize).collect(),
+                updated_entry_wires: new_entries.iter().map(|wire| *wire as usize).collect(),
+            });
         self.memory_blocks.insert(block_id.0, new_entries);
         Ok(())
     }
@@ -5174,12 +5219,20 @@ impl R1csSystem {
                 )? {
                     special_progress = true;
                 }
+                if self.populate_memory_op_wires(&mut full, &mut known)? {
+                    special_progress = true;
+                }
                 if !special_progress {
                     break;
                 }
                 progress = true;
             }
-            if self.populate_selector_wires_from_one_hot_patterns(&mut full, &mut known)? {
+            if self.is_satisfied_with_full_witness(&full) {
+                return Some((full, known));
+            }
+            if !self.memory_op_materialization_patterns_recorded
+                && self.populate_selector_wires_from_one_hot_patterns(&mut full, &mut known)?
+            {
                 progress = true;
             }
 
@@ -5317,9 +5370,153 @@ impl R1csSystem {
                 }
                 known[target_wire] = true;
             }
+
+            if self.is_satisfied_with_full_witness(&full) {
+                return Some((full, known));
+            }
         }
 
         Some((full, known))
+    }
+
+    fn populate_memory_op_wires(
+        &self,
+        witness: &mut [FieldElement],
+        known: &mut [bool],
+    ) -> Option<bool> {
+        let mut changed = false;
+        for pattern in &self.memory_op_materialization_patterns {
+            let n_entries = pattern.entry_wires.len();
+            if pattern.selector_wires.len() != n_entries
+                || pattern.weighted_entry_wires.len() != n_entries
+                || pattern.active_write_wires.len() != n_entries
+                || pattern.delta_wires.len() != n_entries
+                || pattern.updated_entry_wires.len() != n_entries
+            {
+                return None;
+            }
+
+            if !wire_is_in_materialization_range(pattern.operation_wire, witness, known)
+                || !wire_is_in_materialization_range(pattern.index_wire, witness, known)
+                || !wire_is_in_materialization_range(pattern.value_wire, witness, known)
+                || !wire_is_in_materialization_range(pattern.selected_old_wire, witness, known)
+            {
+                return None;
+            }
+
+            for wire in pattern
+                .entry_wires
+                .iter()
+                .chain(pattern.selector_wires.iter())
+                .chain(pattern.weighted_entry_wires.iter())
+                .chain(pattern.active_write_wires.iter())
+                .chain(pattern.delta_wires.iter())
+                .chain(pattern.updated_entry_wires.iter())
+            {
+                if !wire_is_in_materialization_range(*wire, witness, known) {
+                    return None;
+                }
+            }
+
+            if known[pattern.index_wire] {
+                let index = field_to_usize(witness[pattern.index_wire])?;
+                if index >= n_entries {
+                    return None;
+                }
+
+                for (position, selector_wire) in pattern.selector_wires.iter().copied().enumerate()
+                {
+                    let value = if position == index {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    };
+                    changed |= assign_materialized_wire(witness, known, selector_wire, value)?;
+                }
+            }
+
+            let mut selected_old = FieldElement::zero();
+            let mut all_weighted_entries_known = true;
+            for ((entry_wire, selector_wire), weighted_entry_wire) in pattern
+                .entry_wires
+                .iter()
+                .copied()
+                .zip(pattern.selector_wires.iter().copied())
+                .zip(pattern.weighted_entry_wires.iter().copied())
+            {
+                if known[entry_wire] && known[selector_wire] {
+                    let value = witness[entry_wire] * witness[selector_wire];
+                    changed |=
+                        assign_materialized_wire(witness, known, weighted_entry_wire, value)?;
+                }
+
+                if known[weighted_entry_wire] {
+                    selected_old += witness[weighted_entry_wire];
+                } else {
+                    all_weighted_entries_known = false;
+                }
+            }
+            if all_weighted_entries_known {
+                changed |= assign_materialized_wire(
+                    witness,
+                    known,
+                    pattern.selected_old_wire,
+                    selected_old,
+                )?;
+            }
+
+            for (
+                ((entry_wire, selector_wire), active_write_wire),
+                (delta_wire, updated_entry_wire),
+            ) in pattern
+                .entry_wires
+                .iter()
+                .copied()
+                .zip(pattern.selector_wires.iter().copied())
+                .zip(pattern.active_write_wires.iter().copied())
+                .zip(
+                    pattern
+                        .delta_wires
+                        .iter()
+                        .copied()
+                        .zip(pattern.updated_entry_wires.iter().copied()),
+                )
+            {
+                if known[pattern.operation_wire] && known[selector_wire] {
+                    let active_write = witness[pattern.operation_wire] * witness[selector_wire];
+                    changed |=
+                        assign_materialized_wire(witness, known, active_write_wire, active_write)?;
+                }
+
+                if known[active_write_wire] {
+                    let active_write = witness[active_write_wire];
+                    if active_write.is_zero() {
+                        changed |= assign_materialized_wire(
+                            witness,
+                            known,
+                            delta_wire,
+                            FieldElement::zero(),
+                        )?;
+                    } else if known[pattern.value_wire] && known[entry_wire] {
+                        let delta =
+                            active_write * (witness[pattern.value_wire] - witness[entry_wire]);
+                        changed |= assign_materialized_wire(witness, known, delta_wire, delta)?;
+                    }
+                }
+
+                if known[entry_wire] && known[delta_wire] {
+                    let updated_entry = witness[entry_wire] + witness[delta_wire];
+                    changed |= assign_materialized_wire(
+                        witness,
+                        known,
+                        updated_entry_wire,
+                        updated_entry,
+                    )?;
+                }
+            }
+        }
+
+        Some(changed)
     }
 
     fn seed_materialization(
@@ -5600,6 +5797,28 @@ impl R1csSystem {
         }
         patterns
     }
+}
+
+fn wire_is_in_materialization_range(wire: usize, witness: &[FieldElement], known: &[bool]) -> bool {
+    wire < witness.len() && wire < known.len()
+}
+
+fn assign_materialized_wire(
+    witness: &mut [FieldElement],
+    known: &mut [bool],
+    wire: usize,
+    value: FieldElement,
+) -> Option<bool> {
+    if !wire_is_in_materialization_range(wire, witness, known) {
+        return None;
+    }
+    if known[wire] {
+        return (witness[wire] == value).then_some(false);
+    }
+
+    witness[wire] = value;
+    known[wire] = true;
+    Some(true)
 }
 
 fn boolean_constraint_wire(
@@ -6538,6 +6757,8 @@ mod tests {
             }]],
             c: vec![Vec::new()],
             derived_wire_values: BTreeMap::new(),
+            memory_op_materialization_patterns: Vec::new(),
+            memory_op_materialization_patterns_recorded: false,
         };
 
         assert!(!system.is_satisfied(&[FieldElement::one(), FieldElement::one()]));
@@ -8454,6 +8675,209 @@ mod tests {
         assert!(
             system.is_satisfied(&partial_witness),
             "materialized witness should satisfy dynamic memory read constraints"
+        );
+    }
+
+    #[test]
+    fn materialized_witness_satisfies_dynamic_memory_write_then_read_constraints() {
+        let circuit = Circuit {
+            current_witness_index: 6,
+            opcodes: vec![
+                Opcode::MemoryInit {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    init: vec![Witness(0), Witness(1), Witness(2), Witness(3)],
+                    block_type: BlockType::Memory,
+                },
+                Opcode::MemoryOp {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    op: MemOp::write_to_mem_index(
+                        Expression::from(Witness(4)),
+                        Expression::from(Witness(5)),
+                    ),
+                },
+                Opcode::MemoryOp {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    op: MemOp::read_at_mem_index(Expression::from(Witness(4)), Witness(6)),
+                },
+            ],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+                Witness(6),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("dynamic memory write/read should compile");
+        assert_eq!(system.memory_op_materialization_patterns.len(), 2);
+        let partial_witness = vec![
+            FieldElement::one(),
+            FieldElement::from(5u128),
+            FieldElement::from(11u128),
+            FieldElement::from(17u128),
+            FieldElement::from(23u128),
+            FieldElement::from(1u128),
+            FieldElement::from(99u128),
+            FieldElement::from(99u128),
+        ];
+        let full = system
+            .materialize_witness(&partial_witness)
+            .expect("dynamic write/read witness should materialize");
+        assert!(system.is_satisfied_with_full_witness(&full));
+
+        let write_pattern = &system.memory_op_materialization_patterns[0];
+        assert_eq!(
+            full[write_pattern.updated_entry_wires[1]],
+            FieldElement::from(99u128)
+        );
+        assert_eq!(
+            full[write_pattern.updated_entry_wires[0]],
+            FieldElement::from(5u128)
+        );
+        assert_eq!(
+            full[write_pattern.updated_entry_wires[2]],
+            FieldElement::from(17u128)
+        );
+        assert_eq!(
+            full[write_pattern.updated_entry_wires[3]],
+            FieldElement::from(23u128)
+        );
+    }
+
+    #[test]
+    fn tampered_materialized_memory_wires_fail_constraints() {
+        let circuit = Circuit {
+            current_witness_index: 6,
+            opcodes: vec![
+                Opcode::MemoryInit {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    init: vec![Witness(0), Witness(1), Witness(2), Witness(3)],
+                    block_type: BlockType::Memory,
+                },
+                Opcode::MemoryOp {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    op: MemOp::write_to_mem_index(
+                        Expression::from(Witness(4)),
+                        Expression::from(Witness(5)),
+                    ),
+                },
+                Opcode::MemoryOp {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    op: MemOp::read_at_mem_index(Expression::from(Witness(4)), Witness(6)),
+                },
+            ],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+                Witness(5),
+                Witness(6),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("dynamic memory write/read should compile");
+        let partial_witness = vec![
+            FieldElement::one(),
+            FieldElement::from(5u128),
+            FieldElement::from(11u128),
+            FieldElement::from(17u128),
+            FieldElement::from(23u128),
+            FieldElement::from(1u128),
+            FieldElement::from(99u128),
+            FieldElement::from(99u128),
+        ];
+        let full = system
+            .materialize_witness(&partial_witness)
+            .expect("dynamic write/read witness should materialize");
+        assert!(system.is_satisfied_with_full_witness(&full));
+
+        let read_pattern = &system.memory_op_materialization_patterns[1];
+        let mut tampered_selected = full.clone();
+        tampered_selected[read_pattern.selected_old_wire] += FieldElement::one();
+        assert!(!system.is_satisfied_with_full_witness(&tampered_selected));
+
+        let mut tampered_output = partial_witness.clone();
+        tampered_output[7] += FieldElement::one();
+        assert!(!system.is_satisfied(&tampered_output));
+    }
+
+    #[test]
+    fn inactive_memory_write_materializes_zero_delta_and_preserves_entries() {
+        let circuit = Circuit {
+            current_witness_index: 4,
+            opcodes: vec![
+                Opcode::MemoryInit {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    init: vec![Witness(0), Witness(1), Witness(2)],
+                    block_type: BlockType::Memory,
+                },
+                Opcode::MemoryOp {
+                    block_id: acir::circuit::opcodes::BlockId(0),
+                    op: MemOp {
+                        operation: Expression::zero(),
+                        index: Expression::from(Witness(3)),
+                        value: Expression::from(Witness(4)),
+                    },
+                },
+            ],
+            private_parameters: BTreeSet::from([
+                Witness(0),
+                Witness(1),
+                Witness(2),
+                Witness(3),
+                Witness(4),
+            ]),
+            ..Circuit::default()
+        };
+        let program = Program {
+            functions: vec![circuit],
+            unconstrained_functions: Vec::new(),
+        };
+
+        let system = compile_r1cs(&program).expect("inactive memory write should compile");
+        let partial_witness = vec![
+            FieldElement::one(),
+            FieldElement::from(7u128),
+            FieldElement::from(13u128),
+            FieldElement::from(19u128),
+            FieldElement::from(1u128),
+            FieldElement::from(13u128),
+        ];
+        let full = system
+            .materialize_witness(&partial_witness)
+            .expect("inactive write witness should materialize");
+        assert!(system.is_satisfied_with_full_witness(&full));
+
+        let pattern = &system.memory_op_materialization_patterns[0];
+        for delta_wire in &pattern.delta_wires {
+            assert_eq!(full[*delta_wire], FieldElement::zero());
+        }
+        assert_eq!(
+            full[pattern.updated_entry_wires[0]],
+            FieldElement::from(7u128)
+        );
+        assert_eq!(
+            full[pattern.updated_entry_wires[1]],
+            FieldElement::from(13u128)
+        );
+        assert_eq!(
+            full[pattern.updated_entry_wires[2]],
+            FieldElement::from(19u128)
         );
     }
 
